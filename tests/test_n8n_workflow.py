@@ -76,11 +76,16 @@ def test_workflow_has_three_priority_routes_and_clean_error_route() -> None:
     assert "VALIDATION_ERROR" in validation_code
     assert "INVALID_FLOWPILOT_RESPONSE" in validation_code
 
+    validation_outputs = workflow["connections"]["Validate API Result"]["main"]
+    assert validation_outputs[0][0]["node"] == "Persist Only Valid Analysis"
 
-def test_workflow_contains_no_credentials_or_sample_customer_data() -> None:
+
+def test_workflow_contains_no_secrets_or_sample_customer_data() -> None:
     workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    postgres = nodes_by_name(load_workflow())["Persist Lead in PostgreSQL"]
 
     assert "john@example.com" not in workflow_text.lower()
     assert "acme industries" not in workflow_text.lower()
     assert "api_key" not in workflow_text.lower()
+    assert set(postgres["credentials"]["postgres"]) == {"id", "name"}
     assert workflow_text.count("n8n-nodes-base.respondToWebhook") == 2
