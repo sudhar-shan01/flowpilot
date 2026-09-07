@@ -2,13 +2,16 @@
 
 FlowPilot is a portfolio-grade, AI-powered business workflow automation platform. The project is being built incrementally to demonstrate practical Python, API, AI, integration, reliability, and deployment skills without hiding the core ideas behind unnecessary infrastructure.
 
-This repository currently contains **Phase 1 only: the AI Lead Analysis API**.
+This repository currently contains **Phase 1: the AI Lead Analysis API** and
+**Phase 2: n8n webhook intake and priority routing**.
 
 ## Business problem
 
 Inbound leads often arrive as unstructured messages. Someone must read each request, identify what the prospect needs, estimate its quality and urgency, and decide what should happen next. That manual triage becomes slow and inconsistent as lead volume grows.
 
-FlowPilot Phase 1 turns a validated lead submission into a predictable, structured analysis that downstream automation can consume later.
+FlowPilot turns a validated lead submission into a predictable, structured
+analysis. Phase 2 adds a real workflow entry point that routes the result by
+priority without duplicating AI logic outside the API.
 
 ## Current capabilities
 
@@ -20,6 +23,9 @@ FlowPilot Phase 1 turns a validated lead submission into a predictable, structur
 - Controlled responses for missing credentials, timeouts, provider failures, and malformed model output
 - Automated, network-free endpoint and failure-path tests
 - Interactive API documentation at `/docs`
+- Importable n8n lead-intake workflow at `n8n/flowpilot-lead-workflow.json`
+- High, medium, and low priority routing with clean webhook responses
+- Sanitized n8n responses for validation, availability, and malformed-result errors
 
 ## Architecture
 
@@ -40,6 +46,21 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
+Phase 2 extends this architecture without changing the Phase 1 API:
+
+```text
+Webhook caller
+    │
+    ▼
+n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
+                                                    │
+                                                    ▼
+                                      Priority switch (high/medium/low)
+                                                    │
+                                                    ▼
+                                          Clean webhook response
+```
+
 ## Project structure
 
 ```text
@@ -59,8 +80,12 @@ flowpilot/
 │   └── main.py
 ├── tests/
 │   ├── conftest.py
+│   ├── e2e_flowpilot_app.py
 │   ├── test_health.py
-│   └── test_leads.py
+│   ├── test_leads.py
+│   └── test_n8n_workflow.py
+├── n8n/
+│   └── flowpilot-lead-workflow.json
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -137,6 +162,131 @@ The exact analysis varies by model, but it always follows this schema:
 
 Expected service errors use generic messages and do not expose stack traces or provider response bodies. Lead names, email addresses, companies, and messages are not written to application logs.
 
+## Phase 2: n8n webhook integration
+
+Phase 2 adds an n8n workflow that accepts an incoming lead, maps only the five
+fields required by `LeadRequest`, calls the existing FlowPilot API, validates the
+structured result, and routes it through explicit high, medium, or low branches.
+The branches only prepare different webhook messages; they do not send email or
+write to another system.
+
+### Prerequisites
+
+- The Phase 1 API installed and configured as described above
+- n8n 2.x; the committed export is verified with n8n `2.37.10`
+- A valid `OPENAI_API_KEY` in FlowPilot's local `.env` for real AI analysis
+
+### Import the workflow
+
+1. Start n8n and open `http://localhost:5678`.
+2. Open **Workflows**, choose **Import from File**, and select
+   `n8n/flowpilot-lead-workflow.json`.
+3. Review the **Analyze Lead with FlowPilot** HTTP Request node.
+4. Save and activate the workflow to register its production webhook.
+
+The export is inactive by design so importing it cannot unexpectedly expose a
+webhook. No n8n credentials are required or included.
+
+### Start FlowPilot
+
+From the repository root, with the Python virtual environment active:
+
+```powershell
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Confirm `http://127.0.0.1:8000/health` returns `{"status":"healthy"}` before
+starting n8n.
+
+### Start and configure n8n
+
+If n8n runs directly on the same machine as FlowPilot:
+
+```powershell
+$env:FLOWPILOT_API_URL = "http://127.0.0.1:8000"
+$env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
+npx n8n@2.37.10 start
+```
+
+If n8n runs in Docker Desktop while FlowPilot runs on the host:
+
+```powershell
+docker run --rm -it --name flowpilot-n8n `
+  -p 5678:5678 `
+  -e FLOWPILOT_API_URL=http://host.docker.internal:8000 `
+  -e N8N_BLOCK_ENV_ACCESS_IN_NODE=false `
+  -v n8n_data:/home/node/.n8n `
+  docker.n8n.io/n8nio/n8n:2.37.10
+```
+
+`FLOWPILOT_API_URL` is the API base URL without `/lead/analyze`. When the
+variable is absent, the workflow uses
+`http://host.docker.internal:8000` as its Docker Desktop-friendly fallback.
+Current n8n releases block `$env` expressions by default, so the examples
+explicitly allow them. Keep secrets out of the n8n process environment when
+using this setting; this workflow only reads the non-secret API base URL.
+
+### Webhook URLs
+
+- Production, after activation:
+  `http://localhost:5678/webhook/flowpilot/lead`
+- Test, while **Listen for test event** is active in the editor:
+  `http://localhost:5678/webhook-test/flowpilot/lead`
+
+Example production request:
+
+```bash
+curl -X POST http://localhost:5678/webhook/flowpilot/lead \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "John Doe",
+    "email": "john@example.com",
+    "company": "Acme Industries",
+    "message": "We need inventory automation for our company.",
+    "budget": 5000
+  }'
+```
+
+A successful high-priority response has this shape:
+
+```json
+{
+  "success": true,
+  "route": "high",
+  "message": "High-priority lead received. Schedule a discovery call promptly.",
+  "analysis": {
+    "category": "workflow automation",
+    "priority": "high",
+    "lead_score": 88,
+    "short_summary": "Company needs inventory automation.",
+    "recommended_action": "Schedule a discovery call."
+  }
+}
+```
+
+The medium and low branches return the same structure with their matching
+`route` and branch message. Error responses intentionally omit internal details:
+
+- HTTP `422`, `VALIDATION_ERROR`: the incoming lead failed Phase 1 validation
+- HTTP `503`, `FLOWPILOT_UNAVAILABLE`: n8n could not reach the API
+- HTTP `503`, `FLOWPILOT_ERROR`: the API reported that analysis is unavailable
+- HTTP `502`, `INVALID_FLOWPILOT_RESPONSE`: the API returned an unexpected body
+
+### Troubleshooting networking
+
+- **n8n and FlowPilot both run on the host:** set
+  `FLOWPILOT_API_URL=http://127.0.0.1:8000`.
+- **n8n runs in Docker Desktop and FlowPilot runs on the host:** use
+  `http://host.docker.internal:8000`. `localhost` inside the n8n container points
+  back to that container, not to FlowPilot.
+- **Linux Docker Engine:** add an appropriate host-gateway mapping or set
+  `FLOWPILOT_API_URL` to an address the container can reach.
+- **FlowPilot returns `503`:** confirm `OPENAI_API_KEY` is present in FlowPilot's
+  `.env`, then restart the API.
+- **n8n blocks `$env` access:** set `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` and
+  restart n8n. On a hardened shared instance, leave the block enabled and set a
+  non-secret local URL directly in the HTTP Request node instead.
+
 ## Run tests
 
 ```powershell
@@ -147,8 +297,8 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 
 ## Roadmap
 
-- **Phase 1:** AI Lead Analysis API
-- **Phase 2:** n8n webhook integration
+- **Phase 1 (complete):** AI Lead Analysis API
+- **Phase 2 (complete):** n8n webhook integration
 - **Phase 3:** Google Sheets and PostgreSQL persistence
 - **Phase 4:** CRM integration
 - **Phase 5:** Email notifications and AI-generated draft responses
@@ -158,4 +308,4 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 9:** Docker deployment
 - **Phase 10:** Cloud deployment
 
-Development stops at Phase 1 until it has been reviewed and approved.
+Development stops at Phase 2 until it has been reviewed and approved.
