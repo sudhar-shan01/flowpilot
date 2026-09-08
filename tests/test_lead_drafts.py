@@ -82,6 +82,28 @@ def test_draft_endpoint_validates_input(client: TestClient) -> None:
 @pytest.mark.parametrize(
     "draft",
     [
+        pytest.param({"subject": " ", "body": "Useful body"}, id="blank-subject"),
+        pytest.param({"subject": "Useful subject", "body": " \t "}, id="blank-body"),
+    ],
+)
+def test_draft_endpoint_rejects_whitespace_only_output(
+    client: TestClient,
+    draft_request: dict[str, Any],
+    draft: dict[str, object],
+) -> None:
+    override_provider(DraftProvider(draft))
+
+    response = client.post("/lead/draft", json=draft_request)
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "AI draft service returned an invalid response."
+    }
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
         {"subject": "", "body": "Useful body"},
         {"subject": "Useful subject", "body": ""},
         {"subject": "Useful subject", "body": "<script>alert('x')</script>"},

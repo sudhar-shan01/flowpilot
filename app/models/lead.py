@@ -59,6 +59,14 @@ class LeadDraft(StrictAPIModel):
     subject: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=2_000)
 
+    @field_validator("subject", "body")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        """Reject draft fields that contain only whitespace."""
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
     @field_validator("subject")
     @classmethod
     def subject_must_be_one_line(cls, value: str) -> str:
