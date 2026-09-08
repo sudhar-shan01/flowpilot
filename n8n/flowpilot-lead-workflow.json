@@ -1,5 +1,5 @@
 {
-  "name": "FlowPilot - Lead Intake, PostgreSQL Persistence, and Priority Routing",
+  "name": "FlowPilot - Lead Intake, PostgreSQL and Google Sheets Persistence, and Priority Routing",
   "nodes": [
     {
       "parameters": {
@@ -174,7 +174,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const stored = $json;\n\nif (!stored.id || !stored.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be saved.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    lead: {\n      name: stored.name,\n      email: stored.email,\n      company: stored.company,\n      message: stored.message,\n      budget: Number(stored.budget),\n    },\n    analysis: {\n      category: stored.category,\n      priority: stored.priority,\n      lead_score: stored.lead_score,\n      short_summary: stored.short_summary,\n      recommended_action: stored.recommended_action,\n    },\n  },\n}];"
+        "jsCode": "const stored = $json;\n\nif (!stored.id || !stored.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be saved.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    created_at: stored.created_at,\n    lead: {\n      name: stored.name,\n      email: stored.email,\n      company: stored.company,\n      message: stored.message,\n      budget: Number(stored.budget),\n    },\n    analysis: {\n      category: stored.category,\n      priority: stored.priority,\n      lead_score: stored.lead_score,\n      short_summary: stored.short_summary,\n      recommended_action: stored.recommended_action,\n    },\n  },\n}];"
       },
       "id": "e85d491d-48c0-46cb-a05e-167bc1ae2a36",
       "name": "Sanitize Persistence Result",
@@ -182,6 +182,213 @@
       "typeVersion": 2,
       "position": [
         520,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "44bc5a1c-806a-47cc-9bc9-1b228a6d1285",
+                    "leftValue": "={{ $json.success === true && $json.created_at ? 'ready' : 'error' }}",
+                    "rightValue": "ready",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "ready"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "4c0b0b6b-e55c-4f26-9688-eb8d1c7c6395",
+      "name": "Persist to Google Sheets Only After PostgreSQL",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        760,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "Select the FlowPilot lead spreadsheet"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "created_at": "={{ $json.created_at }}",
+            "name": "={{ $json.lead.name }}",
+            "email": "={{ $json.lead.email }}",
+            "company": "={{ $json.lead.company }}",
+            "message": "={{ $json.lead.message }}",
+            "budget": "={{ $json.lead.budget }}",
+            "category": "={{ $json.analysis.category }}",
+            "priority": "={{ $json.analysis.priority }}",
+            "lead_score": "={{ $json.analysis.lead_score }}",
+            "short_summary": "={{ $json.analysis.short_summary }}",
+            "recommended_action": "={{ $json.analysis.recommended_action }}"
+          },
+          "schema": [
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "name",
+              "displayName": "name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "budget",
+              "displayName": "budget",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "lead_score",
+              "displayName": "lead_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "short_summary",
+              "displayName": "short_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recommended_action",
+              "displayName": "recommended_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fe99eb55-4640-48f4-a98e-bc9e5d272258",
+      "name": "Append Lead to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1000,
+        20
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "0e16f7a5-5ce6-4bf5-b83c-2ee2a5d5012b",
+          "name": "FlowPilot Google Sheets"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const sheetsResult = $json;\nconst persisted = $('Sanitize Persistence Result').item.json;\nconst sheetsFailed = Boolean(sheetsResult.error) || sheetsResult.success === false;\n\nif (sheetsFailed || !persisted?.success || !persisted?.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be fully persisted.',\n      },\n    },\n  }];\n}\n\nreturn [{ json: persisted }];"
+      },
+      "id": "ce27bc8b-1a09-4b91-8cbd-bcb4bc0887aa",
+      "name": "Sanitize Google Sheets Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
         20
       ]
     },
@@ -272,7 +479,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        760,
+        1480,
         20
       ]
     },
@@ -302,7 +509,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1000,
+        1720,
         -160
       ]
     },
@@ -332,7 +539,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1000,
+        1720,
         0
       ]
     },
@@ -362,7 +569,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1000,
+        1720,
         160
       ]
     },
@@ -379,7 +586,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1240,
+        1960,
         0
       ]
     },
@@ -396,7 +603,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1000,
+        1720,
         340
       ]
     }
@@ -480,6 +687,46 @@
       "main": [
         [
           {
+            "node": "Persist to Google Sheets Only After PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist to Google Sheets Only After PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "Append Lead to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Lead to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Google Sheets Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Google Sheets Result": {
+      "main": [
+        [
+          {
             "node": "Route by Priority",
             "type": "main",
             "index": 0
@@ -557,7 +804,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "68a82e65-ded6-49d0-ad51-58400ed2c390",
+  "versionId": "b568a817-8e6f-4e02-8c0f-24b850c3b3a6",
   "meta": {
     "templateCredsSetupCompleted": true
   },
