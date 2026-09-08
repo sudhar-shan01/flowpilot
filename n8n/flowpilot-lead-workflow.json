@@ -1,5 +1,5 @@
 {
-  "name": "FlowPilot - Lead Intake and Priority Routing",
+  "name": "FlowPilot - Lead Intake, PostgreSQL Persistence, and Priority Routing",
   "nodes": [
     {
       "parameters": {
@@ -93,7 +93,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const response = $json;\nconst statusCode = Number(response.statusCode ?? 0);\n\nconst errorResult = (code, message, responseStatus) => [{\n  json: {\n    success: false,\n    statusCode: responseStatus,\n    error: { code, message },\n  },\n}];\n\nif (!statusCode) {\n  return errorResult(\n    'FLOWPILOT_UNAVAILABLE',\n    'FlowPilot API is unavailable. Please try again later.',\n    503,\n  );\n}\n\nif (statusCode === 422) {\n  return errorResult(\n    'VALIDATION_ERROR',\n    'Lead payload failed validation.',\n    422,\n  );\n}\n\nif (statusCode < 200 || statusCode >= 300) {\n  return errorResult(\n    'FLOWPILOT_ERROR',\n    'FlowPilot could not analyze the lead.',\n    statusCode === 503 ? 503 : 502,\n  );\n}\n\nconst analysis = response.body;\nconst priorities = new Set(['high', 'medium', 'low']);\nconst isNonEmptyString = (value) =>\n  typeof value === 'string' && value.trim().length > 0;\nconst isValid =\n  analysis &&\n  typeof analysis === 'object' &&\n  !Array.isArray(analysis) &&\n  isNonEmptyString(analysis.category) &&\n  priorities.has(analysis.priority) &&\n  Number.isInteger(analysis.lead_score) &&\n  analysis.lead_score >= 0 &&\n  analysis.lead_score <= 100 &&\n  isNonEmptyString(analysis.short_summary) &&\n  isNonEmptyString(analysis.recommended_action);\n\nif (!isValid) {\n  return errorResult(\n    'INVALID_FLOWPILOT_RESPONSE',\n    'FlowPilot returned an unexpected response.',\n    502,\n  );\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    analysis,\n  },\n}];"
+        "jsCode": "const response = $json;\nconst statusCode = Number(response.statusCode ?? 0);\n\nconst errorResult = (code, message, responseStatus) => [{\n  json: {\n    success: false,\n    statusCode: responseStatus,\n    error: { code, message },\n  },\n}];\n\nif (!statusCode) {\n  return errorResult(\n    'FLOWPILOT_UNAVAILABLE',\n    'FlowPilot API is unavailable. Please try again later.',\n    503,\n  );\n}\n\nif (statusCode === 422) {\n  return errorResult(\n    'VALIDATION_ERROR',\n    'Lead payload failed validation.',\n    422,\n  );\n}\n\nif (statusCode < 200 || statusCode >= 300) {\n  return errorResult(\n    'FLOWPILOT_ERROR',\n    'FlowPilot could not analyze the lead.',\n    statusCode === 503 ? 503 : 502,\n  );\n}\n\nconst analysis = response.body;\nconst priorities = new Set(['high', 'medium', 'low']);\nconst isNonEmptyString = (value) =>\n  typeof value === 'string' && value.trim().length > 0;\nconst isValid =\n  analysis &&\n  typeof analysis === 'object' &&\n  !Array.isArray(analysis) &&\n  isNonEmptyString(analysis.category) &&\n  priorities.has(analysis.priority) &&\n  Number.isInteger(analysis.lead_score) &&\n  analysis.lead_score >= 0 &&\n  analysis.lead_score <= 100 &&\n  isNonEmptyString(analysis.short_summary) &&\n  isNonEmptyString(analysis.recommended_action);\n\nif (!isValid) {\n  return errorResult(\n    'INVALID_FLOWPILOT_RESPONSE',\n    'FlowPilot returned an unexpected response.',\n    502,\n  );\n}\n\nconst lead = $('Prepare Lead').item.json;\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    lead,\n    analysis,\n  },\n}];"
       },
       "id": "4c95fe76-a97a-45b1-bff4-d0df29e1d686",
       "name": "Validate API Result",
@@ -102,6 +102,87 @@
       "position": [
         -200,
         100
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "857c6a97-4d30-46e2-ad3c-249bc57d9f24",
+                    "leftValue": "={{ $json.success ? 'valid' : 'error' }}",
+                    "rightValue": "valid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "valid"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "752ef48e-aaec-43ec-96ac-7154637969ec",
+      "name": "Persist Only Valid Analysis",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        40,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads (name, email, company, message, budget, category, priority, lead_score, short_summary, recommended_action)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\nRETURNING id, created_at, name, email, company, message, budget, category, priority, lead_score, short_summary, recommended_action;",
+        "options": {
+          "queryReplacement": "={{ [$json.lead.name, $json.lead.email, $json.lead.company, $json.lead.message, $json.lead.budget, $json.analysis.category, $json.analysis.priority, $json.analysis.lead_score, $json.analysis.short_summary, $json.analysis.recommended_action] }}"
+        }
+      },
+      "id": "c97cf555-fca4-4840-8d43-80f0e6f3a6cc",
+      "name": "Persist Lead in PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        20
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const stored = $json;\n\nif (!stored.id || !stored.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be saved.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    lead: {\n      name: stored.name,\n      email: stored.email,\n      company: stored.company,\n      message: stored.message,\n      budget: Number(stored.budget),\n    },\n    analysis: {\n      category: stored.category,\n      priority: stored.priority,\n      lead_score: stored.lead_score,\n      short_summary: stored.short_summary,\n      recommended_action: stored.recommended_action,\n    },\n  },\n}];"
+      },
+      "id": "e85d491d-48c0-46cb-a05e-167bc1ae2a36",
+      "name": "Sanitize Persistence Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        20
       ]
     },
     {
@@ -191,8 +272,8 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        40,
-        100
+        760,
+        20
       ]
     },
     {
@@ -221,8 +302,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        300,
-        -80
+        1000,
+        -160
       ]
     },
     {
@@ -251,8 +332,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        300,
-        40
+        1000,
+        0
       ]
     },
     {
@@ -281,7 +362,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        300,
+        1000,
         160
       ]
     },
@@ -298,8 +379,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        580,
-        40
+        1240,
+        0
       ]
     },
     {
@@ -315,8 +396,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        300,
-        300
+        1000,
+        340
       ]
     }
   ],
@@ -356,6 +437,46 @@
       ]
     },
     "Validate API Result": {
+      "main": [
+        [
+          {
+            "node": "Persist Only Valid Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Only Valid Analysis": {
+      "main": [
+        [
+          {
+            "node": "Persist Lead in PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Lead in PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Persistence Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Persistence Result": {
       "main": [
         [
           {
@@ -436,10 +557,10 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "b5a5c57f-4ef7-4d41-aac3-a4110eefbb5b",
+  "versionId": "68a82e65-ded6-49d0-ad51-58400ed2c390",
   "meta": {
     "templateCredsSetupCompleted": true
   },
-  "id": "flowpilotPhase2",
+  "id": "flowpilotPhase3A",
   "tags": []
 }
