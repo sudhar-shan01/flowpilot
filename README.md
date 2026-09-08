@@ -3,9 +3,8 @@
 FlowPilot is a portfolio-grade, AI-powered business workflow automation platform. The project is being built incrementally to demonstrate practical Python, API, AI, integration, reliability, and deployment skills without hiding the core ideas behind unnecessary infrastructure.
 
 This repository currently contains **Phase 1: the AI Lead Analysis API**,
-**Phase 2: n8n webhook intake and priority routing**, and **Phase 3A:
-PostgreSQL persistence**. Google Sheets persistence remains pending for Phase
-3B.
+**Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
+persistence**, and **Phase 3B: Google Sheets persistence**.
 
 ## Business problem
 
@@ -14,7 +13,8 @@ Inbound leads often arrive as unstructured messages. Someone must read each requ
 FlowPilot turns a validated lead submission into a predictable, structured
 analysis. Phase 2 adds a real workflow entry point that routes the result by
 priority without duplicating AI logic outside the API. Phase 3A records each
-successfully validated lead and analysis in PostgreSQL before routing it.
+successfully validated lead and analysis in PostgreSQL. Phase 3B appends that
+same stored lead to Google Sheets before priority routing.
 
 ## Current capabilities
 
@@ -31,7 +31,8 @@ successfully validated lead and analysis in PostgreSQL before routing it.
 - Sanitized n8n responses for validation, availability, and malformed-result errors
 - PostgreSQL persistence for validated lead analyses
 - Version-controlled database schema with range and enum-like constraints
-- Sanitized `PERSISTENCE_ERROR` webhook responses when a lead cannot be saved
+- Google Sheets persistence using the PostgreSQL-generated timestamp
+- Sanitized `PERSISTENCE_ERROR` webhook responses when either persistence step fails
 
 ## Architecture
 
@@ -52,7 +53,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 and 3A extend this architecture without changing the Phase 1 API:
+Phases 2, 3A, and 3B extend this architecture without changing the Phase 1 API:
 
 ```text
 Webhook caller
@@ -63,6 +64,9 @@ n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
                                                     ▼
                                          PostgreSQL `leads`
                                                     │ saved
+                                                    ▼
+                                           Google Sheets row
+                                                    │ appended
                                                     ▼
                                       Priority switch (high/medium/low)
                                                     │
@@ -93,7 +97,8 @@ flowpilot/
 │   ├── test_health.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
-│   └── test_postgres_persistence.py
+│   ├── test_postgres_persistence.py
+│   └── test_google_sheets_persistence.py
 ├── n8n/
 │   └── flowpilot-lead-workflow.json
 ├── postgres/
@@ -181,8 +186,8 @@ Expected service errors use generic messages and do not expose stack traces or p
 Phase 2 adds an n8n workflow that accepts an incoming lead, maps only the five
 fields required by `LeadRequest`, calls the existing FlowPilot API, validates the
 structured result, and routes it through explicit high, medium, or low branches.
-The branches only prepare different webhook messages; they do not send email or
-write to another system.
+The branches only prepare different webhook messages; persistence is handled by
+the Phase 3A and 3B nodes before routing.
 
 ### Prerequisites
 
@@ -196,12 +201,14 @@ write to another system.
 2. Open **Workflows**, choose **Import from File**, and select
    `n8n/flowpilot-lead-workflow.json`.
 3. Review the **Analyze Lead with FlowPilot** HTTP Request node.
-4. Save and activate the workflow to register its production webhook.
+4. Configure the PostgreSQL and Google Sheets nodes as described below.
+5. Save and activate the workflow to register its production webhook.
 
 The export is inactive by design so importing it cannot unexpectedly expose a
-webhook. It references an n8n credential named `FlowPilot PostgreSQL`, but no
-database address, username, or password is included. Create or select that
-credential before activation as described in Phase 3A below.
+webhook. It contains reference metadata for credentials named
+`FlowPilot PostgreSQL` and `FlowPilot Google Sheets`, but no credential payload,
+token, password, database address, or spreadsheet ID. Create or select both
+local credentials before activation as described below.
 
 ### Start FlowPilot
 
@@ -411,6 +418,94 @@ request; and query the newest row as shown above. Stop PostgreSQL with:
 docker compose -f compose.postgres.yml down
 ```
 
+## Phase 3B: Google Sheets persistence
+
+Phase 3B extends only the successful Phase 3A path. After PostgreSQL returns the
+stored row, n8n appends the same lead and analysis to Google Sheets, using
+PostgreSQL's `created_at` value. The existing priority switch and public webhook
+success response run only after both persistence steps succeed.
+
+```text
+Validated analysis
+      │
+      ▼
+PostgreSQL insert
+      │ success
+      ▼
+Google Sheets append
+      │ success
+      ▼
+Priority routing → unchanged webhook response
+```
+
+### Prepare the Google Sheet
+
+Create a spreadsheet and add these headers to row 1, from column A through K in
+exactly this order:
+
+```text
+created_at
+name
+email
+company
+message
+budget
+category
+priority
+lead_score
+short_summary
+recommended_action
+```
+
+Each line above represents one separate header cell. Header spelling and case
+must match because the n8n mappings use these names.
+
+### Configure Google Sheets in n8n
+
+1. Create an n8n **Google Sheets OAuth2 API** credential named
+   `FlowPilot Google Sheets` and complete Google's authorization flow in n8n.
+2. Open **Append Lead to Google Sheets** and select that local credential.
+3. In **Document**, select the spreadsheet from the list. To supply a
+   Spreadsheet ID directly, change the field to **By ID** and paste the ID from
+   the Google Sheets URL.
+4. In **Sheet**, enter the sheet/tab name. The committed workflow uses `Leads`
+   as the non-personal default; change it if your tab has another name.
+5. Confirm **Map Each Column Below** remains selected, then save and activate
+   the workflow.
+
+The node explicitly maps all eleven columns and does not construct rows through
+string concatenation. The workflow export contains only n8n credential-reference
+metadata. OAuth access tokens, refresh tokens, client secrets, service-account
+keys, spreadsheet IDs, and Google account details must stay in n8n or the local
+Google credential and must never be committed.
+
+### Success and partial-failure behavior
+
+On success, the caller still receives only `success`, `route`, `message`, and
+`analysis`; database IDs, timestamps, and spreadsheet details are not exposed.
+
+- If PostgreSQL fails, Google Sheets is bypassed and the existing sanitized
+  `PERSISTENCE_ERROR` is returned.
+- If PostgreSQL succeeds but Google Sheets fails, the PostgreSQL row remains and
+  the caller receives HTTP `503`, `PERSISTENCE_ERROR`, with the generic message
+  `Lead was analyzed but could not be fully persisted.`
+
+Phase 3B intentionally provides no distributed transaction or rollback between
+PostgreSQL and Google Sheets. It also adds no compensation, retries, or
+deduplication. Those reliability features remain scoped to Phase 8.
+
+### Manual verification
+
+Start PostgreSQL, FlowPilot, and n8n; configure both n8n credentials and the
+Google Sheets Document/Sheet fields; then activate the workflow and send the
+Phase 2 example webhook request. Verify that PostgreSQL contains the new row,
+the sheet contains a matching row with the same `created_at`, and the webhook
+response retains the documented Phase 2 shape.
+
+Automated tests require no Google account, credential, network access, or live
+spreadsheet. A live append test requires a user-authorized local Google Sheets
+credential.
+
 ## Run tests
 
 ```powershell
@@ -424,13 +519,13 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 1 (complete):** AI Lead Analysis API
 - **Phase 2 (complete):** n8n webhook integration
 - **Phase 3A (complete):** PostgreSQL persistence
-- **Phase 3B (pending):** Google Sheets persistence
-- **Phase 4:** CRM integration
-- **Phase 5:** Email notifications and AI-generated draft responses
-- **Phase 6:** Human approval workflow
-- **Phase 7:** Automated follow-ups
-- **Phase 8:** Retries, deduplication, observability, and workflow reliability
-- **Phase 9:** Docker deployment
-- **Phase 10:** Cloud deployment
+- **Phase 3B (complete):** Google Sheets persistence
+- **Phase 4 (pending):** CRM integration
+- **Phase 5 (pending):** Email notifications and AI-generated draft responses
+- **Phase 6 (pending):** Human approval workflow
+- **Phase 7 (pending):** Automated follow-ups
+- **Phase 8 (pending):** Retries, deduplication, observability, and workflow reliability
+- **Phase 9 (pending):** Docker deployment
+- **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 3A until it has been reviewed and approved.
+Development stops at Phase 3B until it has been reviewed and approved.
