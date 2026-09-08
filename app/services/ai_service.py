@@ -9,7 +9,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.core.config import Settings
-from app.models.lead import LeadAnalysis, LeadRequest
+from app.models.lead import LeadAnalysis, LeadDraft, LeadDraftRequest, LeadRequest
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +38,21 @@ class AIProvider(ABC):
         """Return untrusted structured data describing the lead."""
         raise NotImplementedError
 
+    async def draft_lead_response(self, request: LeadDraftRequest) -> object:
+        """Return an untrusted structured response draft."""
+        del request
+        raise NotImplementedError
+
 
 class UnconfiguredAIProvider(AIProvider):
     """Keeps application startup and health checks independent of AI credentials."""
 
     async def analyze_lead(self, lead: LeadRequest) -> object:
         del lead
+        raise AIConfigurationError("An AI provider API key is required")
+
+    async def draft_lead_response(self, request: LeadDraftRequest) -> object:
+        del request
         raise AIConfigurationError("An AI provider API key is required")
 
 
@@ -117,6 +126,62 @@ class OpenAIProvider(AIProvider):
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AIResponseError("AI provider returned malformed output") from exc
 
+    async def draft_lead_response(self, request: LeadDraftRequest) -> object:
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Write a concise, professional plain-text response draft for an "
+                        "inbound business lead. Use only the supplied lead and analysis. "
+                        "Do not invent pricing, discounts, timelines, promises, capabilities, "
+                        "recipient addresses, names, or signatures. Return only the requested "
+                        "structured subject and body."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(request.model_dump(mode="json")),
+                },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "lead_response_draft",
+                    "strict": True,
+                    "schema": LeadDraft.model_json_schema(),
+                },
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+                response = await client.post(
+                    f"{self._base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise AIProviderUnavailableError("AI provider timed out") from exc
+        except httpx.RequestError as exc:
+            raise AIProviderUnavailableError("AI provider request failed") from exc
+
+        if response.status_code in {401, 403}:
+            raise AIConfigurationError("AI provider rejected its credentials")
+        if not response.is_success:
+            raise AIProviderUnavailableError("AI provider returned an error")
+
+        try:
+            body: dict[str, Any] = response.json()
+            content = body["choices"][0]["message"]["content"]
+            return json.loads(content)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AIResponseError("AI provider returned malformed output") from exc
+
 
 class AIService:
     """Coordinates provider calls and validates all untrusted model output."""
@@ -137,6 +202,20 @@ class AIService:
             return LeadAnalysis.model_validate(raw_result)
         except ValidationError as exc:
             raise AIResponseError("AI response failed schema validation") from exc
+
+    async def draft_lead_response(self, request: LeadDraftRequest) -> LeadDraft:
+        try:
+            raw_result = await self._provider.draft_lead_response(request)
+        except AIServiceError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected AI provider failure")
+            raise AIProviderUnavailableError("Unexpected AI provider failure") from exc
+
+        try:
+            return LeadDraft.model_validate(raw_result)
+        except ValidationError as exc:
+            raise AIResponseError("AI draft failed schema validation") from exc
 
 
 def build_ai_service(settings: Settings) -> AIService:

@@ -4,8 +4,9 @@ FlowPilot is a portfolio-grade, AI-powered business workflow automation platform
 
 This repository currently contains **Phase 1: the AI Lead Analysis API**,
 **Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
-persistence**, **Phase 3B: Google Sheets persistence**, and **Phase 4: HubSpot
-CRM contact synchronization**.
+persistence**, **Phase 3B: Google Sheets persistence**, **Phase 4: HubSpot
+CRM contact synchronization**, and **Phase 5: internal email notifications and
+AI-generated response drafts**.
 
 ## Business problem
 
@@ -16,12 +17,15 @@ analysis. Phase 2 adds a real workflow entry point that routes the result by
 priority without duplicating AI logic outside the API. Phase 3A records each
 successfully validated lead and analysis in PostgreSQL. Phase 3B appends that
 same stored lead to Google Sheets. Phase 4 then synchronizes a HubSpot contact
-by email before priority routing.
+by email. Phase 5 generates and persists a plain-text response draft for human
+approval and sends the configured team recipient an internal notification
+before priority routing.
 
 ## Current capabilities
 
 - `GET /health` for API availability checks
 - `POST /lead/analyze` for validated lead intake and structured AI analysis
+- `POST /lead/draft` for validated, plain-text lead response drafts
 - Category, priority, score, summary, and recommended next action
 - Provider-independent AI service boundary
 - OpenAI-compatible JSON Schema structured output
@@ -37,6 +41,9 @@ by email before priority routing.
 - Sanitized `PERSISTENCE_ERROR` webhook responses when either persistence step fails
 - HubSpot contact lookup with explicit create and update paths keyed by email
 - Sanitized `CRM_ERROR` responses when CRM synchronization fails
+- PostgreSQL draft persistence with `pending_approval` status
+- Internal SMTP notification through the `FlowPilot Email` n8n credential
+- Sanitized `DRAFT_ERROR` and `EMAIL_ERROR` partial-success responses
 
 ## Architecture
 
@@ -57,7 +64,8 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 through 4 extend this architecture without changing the Phase 1 API:
+Phases 2 through 5 extend this architecture without changing the public webhook
+success contract:
 
 ```text
 Webhook caller
@@ -74,6 +82,15 @@ n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
                                                     ▼
                                     HubSpot contact lookup/sync
                                                     │ synchronized
+                                                    ▼
+                                      POST /lead/draft
+                                                    │ validated
+                                                    ▼
+                                    Persist pending response draft
+                                                    │ saved
+                                                    ▼
+                                      Internal email notification
+                                                    │ sent
                                                     ▼
                                       Priority switch (high/medium/low)
                                                     │
@@ -104,6 +121,8 @@ flowpilot/
 │   ├── test_google_sheets_persistence.py
 │   ├── test_health.py
 │   ├── test_hubspot_crm.py
+│   ├── test_email_drafts_workflow.py
+│   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
 │   └── test_postgres_persistence.py
@@ -608,6 +627,97 @@ is not already available locally. The workflow export contains only credential
 reference metadata; OAuth tokens, private-app tokens, client secrets, portal
 IDs, and other account data must remain in n8n and must never be committed.
 
+## Phase 5: Email notifications and AI-generated response drafts
+
+Phase 5 begins only after HubSpot synchronization succeeds. n8n sends the
+validated lead and analysis to `POST /lead/draft`, persists the returned draft,
+and sends an internal notification. The draft is never sent to the lead and is
+not included in the public webhook response.
+
+`POST /lead/draft` accepts this shape:
+
+```json
+{
+  "lead": {
+    "name": "John Doe",
+    "email": "john@example.com",
+    "company": "Acme Industries",
+    "message": "We need help automating our inventory workflow.",
+    "budget": 5000
+  },
+  "analysis": {
+    "category": "workflow automation",
+    "priority": "high",
+    "lead_score": 88,
+    "short_summary": "Acme needs inventory automation.",
+    "recommended_action": "Schedule a discovery call."
+  }
+}
+```
+
+It returns only `subject` and `body`. Both are revalidated after the provider
+call. Subjects must be a single line and no longer than 160 characters; bodies
+are limited to 2,000 characters. Empty values, extra fields, malformed output,
+and HTML-like content are rejected. The provider prompt forbids invented
+pricing, discounts, timelines, promises, capabilities, recipients, names, and
+signatures. Drafts remain plain text and require human approval in Phase 6.
+
+### Draft persistence
+
+`postgres/init/002_add_lead_drafts.sql` upgrades existing `leads` tables by
+adding nullable `draft_subject`, `draft_body`, and `draft_status` columns. The
+workflow updates the row created earlier in the same execution using its
+internal database ID and parameterized SQL. A valid draft is stored with
+`draft_status = 'pending_approval'` before any email node runs. The migration is
+additive and uses `IF NOT EXISTS`, so existing lead rows remain valid.
+
+New PostgreSQL volumes apply both init files automatically. For an existing
+FlowPilot volume, apply the additive migration once without recreating it:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/002_add_lead_drafts.sql'
+```
+
+### Configure internal email
+
+1. Create an n8n SMTP credential named `FlowPilot Email` and select it in
+   **Send Internal Notification**.
+2. Set `FLOWPILOT_INTERNAL_EMAIL_TO` to the trusted team recipient in n8n's
+   local environment.
+3. Set `FLOWPILOT_INTERNAL_EMAIL_FROM` to the sender address allowed by the SMTP
+   account.
+4. Restart n8n after changing its environment, then activate the workflow.
+
+The recipient and sender are local configuration and must never be committed.
+The model cannot provide or override either address. The notification contains
+the lead summary, priority, score, recommended action, and pending draft. The
+email is plain text and is sent only to the configured internal recipient.
+
+### Failure and partial-success behavior
+
+The original failure order remains intact. PostgreSQL failure bypasses Sheets,
+CRM, drafting, and email. Sheets failure bypasses CRM, drafting, and email.
+HubSpot failure bypasses drafting and email. Draft generation, validation, or
+persistence failure returns HTTP `503` with sanitized `DRAFT_ERROR`. Missing or
+invalid recipient configuration and SMTP failures return HTTP `503` with
+sanitized `EMAIL_ERROR`.
+
+Earlier successful PostgreSQL, Google Sheets, and HubSpot work is not rolled
+back. No provider response, draft, recipient, SMTP detail, database ID, HubSpot
+ID, or credential detail is exposed by the error response. On complete success,
+the webhook still returns only `success`, `route`, `message`, and `analysis`.
+
+### Manual verification
+
+Apply the PostgreSQL migrations, start FlowPilot and n8n, configure the existing
+Phase 3 and Phase 4 credentials, add the local `FlowPilot Email` credential and
+the two email environment variables, then submit the documented webhook
+request. Confirm the matching `leads` row contains the draft with
+`pending_approval`, the internal mailbox receives one plain-text notification,
+and the lead receives no email. Live SMTP verification is optional when no
+credential is available; all automated tests remain network-free and
+credential-free.
+
 ## Run tests
 
 ```powershell
@@ -623,11 +733,11 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 3A (complete):** PostgreSQL persistence
 - **Phase 3B (complete):** Google Sheets persistence
 - **Phase 4 (complete):** HubSpot CRM contact synchronization
-- **Phase 5 (pending):** Email notifications and AI-generated draft responses
+- **Phase 5 (complete):** Email notifications and AI-generated draft responses
 - **Phase 6 (pending):** Human approval workflow
 - **Phase 7 (pending):** Automated follow-ups
 - **Phase 8 (pending):** Retries, deduplication, observability, and workflow reliability
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 4 until it has been reviewed and approved.
+Development stops at Phase 5 until it has been reviewed and approved.

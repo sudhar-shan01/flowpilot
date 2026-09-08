@@ -1,5 +1,6 @@
-"""Pydantic models for lead intake and analysis."""
+"""Pydantic models for lead intake, analysis, and response drafts."""
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -43,3 +44,33 @@ class LeadAnalysis(StrictAPIModel):
     lead_score: int = Field(ge=0, le=100)
     short_summary: str = Field(min_length=1, max_length=500)
     recommended_action: str = Field(min_length=1, max_length=500)
+
+
+class LeadDraftRequest(StrictAPIModel):
+    """Validated lead and analysis context used to generate a response draft."""
+
+    lead: LeadRequest
+    analysis: LeadAnalysis
+
+
+class LeadDraft(StrictAPIModel):
+    """Plain-text response draft awaiting human approval."""
+
+    subject: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("subject")
+    @classmethod
+    def subject_must_be_one_line(cls, value: str) -> str:
+        """Keep the subject safe for a plain-text mail header."""
+        if "\n" in value or "\r" in value:
+            raise ValueError("subject must be a single line")
+        return value
+
+    @field_validator("subject", "body")
+    @classmethod
+    def reject_html(cls, value: str) -> str:
+        """Reject HTML-like output; Phase 5 drafts are plain text only."""
+        if re.search(r"<\s*/?\s*[a-z][^>]*>", value, flags=re.IGNORECASE):
+            raise ValueError("HTML is not allowed")
+        return value
