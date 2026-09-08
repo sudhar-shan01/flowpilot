@@ -106,6 +106,310 @@
     },
     {
       "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.FLOWPILOT_API_URL || 'http://host.docker.internal:8000').replace(/\\/$/, '') + '/lead/draft' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead: $json.lead, analysis: $json.analysis }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "95e31a5d-3f7e-48dd-8445-5cdba49b3e14",
+      "name": "Generate Lead Response Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3160,
+        20
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $json;\nconst processed = $('Sanitize HubSpot Result').item.json;\nconst statusCode = Number(response.statusCode ?? 0);\nconst draft = response.body;\nconst draftError = () => [{\n  json: {\n    success: false,\n    statusCode: 503,\n    error: {\n      code: 'DRAFT_ERROR',\n      message: 'Lead was synchronized but a response draft could not be generated.',\n    },\n  },\n}];\n\nif (statusCode < 200 || statusCode >= 300 || !draft || typeof draft !== 'object' || Array.isArray(draft)) {\n  return draftError();\n}\n\nconst subject = typeof draft.subject === 'string' ? draft.subject.trim() : '';\nconst body = typeof draft.body === 'string' ? draft.body.trim() : '';\nconst htmlLike = /<\\s*\\/?\\s*[a-z][^>]*>/i;\nif (!subject || !body || subject.length > 160 || body.length > 2000 || /[\\r\\n]/.test(subject) || htmlLike.test(subject) || htmlLike.test(body)) {\n  return draftError();\n}\n\nreturn [{\n  json: {\n    ...processed,\n    draft: { subject, body, status: 'pending_approval' },\n  },\n}];"
+      },
+      "id": "15b4a941-c33e-4e68-8c63-58bf2e145d1c",
+      "name": "Validate Draft Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8fcb9234-7cb2-49cb-9d75-94e46d46c61b",
+                    "leftValue": "={{ $json.success === true && $json.draft?.status === 'pending_approval' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "valid draft"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "969985ee-12f5-457c-a08c-0c3e19ae6ca7",
+      "name": "Persist Only Valid Draft",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        3640,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET draft_subject = $1, draft_body = $2, draft_status = $3\nWHERE id = $4\nRETURNING id, draft_subject, draft_body, draft_status;",
+        "options": {
+          "queryReplacement": "={{ [$json.draft.subject, $json.draft.body, 'pending_approval', $json.lead_id] }}"
+        }
+      },
+      "id": "21d73873-8a75-43ea-aac6-1c8febc03df4",
+      "name": "Persist Draft in PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3880,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const stored = $json;\nconst prepared = $('Validate Draft Result').item.json;\n\nif (!stored.id || stored.draft_status !== 'pending_approval' || !stored.draft_subject || !stored.draft_body) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'DRAFT_ERROR',\n        message: 'Lead was synchronized but the response draft could not be persisted.',\n      },\n    },\n  }];\n}\n\nreturn [{ json: prepared }];"
+      },
+      "id": "5c1b054d-f5cc-498d-ad67-d9b2af688ee2",
+      "name": "Sanitize Draft Persistence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4120,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9cafc693-3d50-4c93-931b-340692f06886",
+                    "leftValue": "={{ $json.success === true && $json.draft?.status === 'pending_approval' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "persisted"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "b11d7952-4318-463b-8900-5888786b58bb",
+      "name": "Notify Only After Draft Persistence",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        4360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst recipient = String($env.FLOWPILOT_INTERNAL_EMAIL_TO ?? '').trim();\nconst validRecipient = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(recipient);\n\nif (!validRecipient) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst notificationBody = [\n  'A lead has completed FlowPilot processing.',\n  '',\n  `Name: ${data.lead.name}`,\n  `Email: ${data.lead.email}`,\n  `Company: ${data.lead.company}`,\n  `Budget: ${data.lead.budget}`,\n  `Priority: ${data.analysis.priority}`,\n  `Lead score: ${data.analysis.lead_score}`,\n  `Summary: ${data.analysis.short_summary}`,\n  `Recommended action: ${data.analysis.recommended_action}`,\n  '',\n  'Pending lead-response draft',\n  `Subject: ${data.draft.subject}`,\n  '',\n  data.draft.body,\n].join('\\n');\n\nreturn [{\n  json: {\n    ...data,\n    notification: {\n      recipient,\n      subject: `FlowPilot ${data.analysis.priority}-priority lead notification`,\n      body: notificationBody,\n    },\n  },\n}];"
+      },
+      "id": "eb8f34c4-2628-43e5-85e4-c3d165bf8d0c",
+      "name": "Prepare Internal Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "902027c0-26f2-4e91-aa8e-4d839ea9e52e",
+                    "leftValue": "={{ $json.success === true && Boolean($json.notification?.recipient) }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "configured"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "498d5bf0-c31b-4e7b-bff7-eb224fab0fd9",
+      "name": "Send Configured Internal Email",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        4840,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.FLOWPILOT_INTERNAL_EMAIL_FROM }}",
+        "toEmail": "={{ $json.notification.recipient }}",
+        "subject": "={{ $json.notification.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.notification.body }}",
+        "options": {}
+      },
+      "id": "7fb4fe30-5f25-4c1d-a84a-c9c27f4b9533",
+      "name": "Send Internal Notification",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        5080,
+        -20
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "flowpilot-email-credential",
+          "name": "FlowPilot Email"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const emailResult = $json;\nconst prepared = $('Prepare Internal Notification').item.json;\n\nif (emailResult.error || emailResult.success === false) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst { notification, draft, lead_id, ...publicWorkflowData } = prepared;\nreturn [{ json: publicWorkflowData }];"
+      },
+      "id": "da840f9e-cc3e-42bc-994a-94676166495f",
+      "name": "Sanitize Email Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5320,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8e704256-16d6-4cf2-9da4-c01ef827a544",
+                    "leftValue": "={{ $json.success === true }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sent"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "d53711ed-19da-4336-8bb0-38ea8d355803",
+      "name": "Route After Email Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        5560,
+        -20
+      ]
+    },
+    {
+      "parameters": {
         "rules": {
           "values": [
             {
@@ -174,7 +478,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const stored = $json;\n\nif (!stored.id || !stored.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be saved.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    created_at: stored.created_at,\n    lead: {\n      name: stored.name,\n      email: stored.email,\n      company: stored.company,\n      message: stored.message,\n      budget: Number(stored.budget),\n    },\n    analysis: {\n      category: stored.category,\n      priority: stored.priority,\n      lead_score: stored.lead_score,\n      short_summary: stored.short_summary,\n      recommended_action: stored.recommended_action,\n    },\n  },\n}];"
+        "jsCode": "const stored = $json;\n\nif (!stored.id || !stored.created_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'PERSISTENCE_ERROR',\n        message: 'Lead was analyzed but could not be saved.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    success: true,\n    statusCode: 200,\n    lead_id: stored.id,\n    created_at: stored.created_at,\n    lead: {\n      name: stored.name,\n      email: stored.email,\n      company: stored.company,\n      message: stored.message,\n      budget: Number(stored.budget),\n    },\n    analysis: {\n      category: stored.category,\n      priority: stored.priority,\n      lead_score: stored.lead_score,\n      short_summary: stored.short_summary,\n      recommended_action: stored.recommended_action,\n    },\n  },\n}];"
       },
       "id": "e85d491d-48c0-46cb-a05e-167bc1ae2a36",
       "name": "Sanitize Persistence Result",
@@ -730,7 +1034,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        3160,
+        5800,
         20
       ]
     },
@@ -760,7 +1064,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        3400,
+        6040,
         -160
       ]
     },
@@ -790,7 +1094,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        3400,
+        6040,
         0
       ]
     },
@@ -820,7 +1124,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        3400,
+        6040,
         160
       ]
     },
@@ -837,7 +1141,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        3640,
+        6280,
         0
       ]
     },
@@ -854,7 +1158,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        3160,
+        5800,
         340
       ]
     }
@@ -1087,7 +1391,156 @@
       "main": [
         [
           {
+            "node": "Generate Lead Response Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Lead Response Draft": {
+      "main": [
+        [
+          {
+            "node": "Validate Draft Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Draft Result": {
+      "main": [
+        [
+          {
+            "node": "Persist Only Valid Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Only Valid Draft": {
+      "main": [
+        [
+          {
+            "node": "Persist Draft in PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Draft in PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Draft Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Draft Persistence": {
+      "main": [
+        [
+          {
+            "node": "Notify Only After Draft Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Only After Draft Persistence": {
+      "main": [
+        [
+          {
+            "node": "Prepare Internal Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Internal Notification": {
+      "main": [
+        [
+          {
+            "node": "Send Configured Internal Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Configured Internal Email": {
+      "main": [
+        [
+          {
+            "node": "Send Internal Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Internal Notification": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Email Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Email Result": {
+      "main": [
+        [
+          {
+            "node": "Route After Email Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route After Email Result": {
+      "main": [
+        [
+          {
             "node": "Route by Priority",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
             "type": "main",
             "index": 0
           }

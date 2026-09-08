@@ -38,7 +38,9 @@ def test_hubspot_sync_runs_after_sheets_and_before_priority_routing() -> None:
     assert first_target(workflow, "Search HubSpot Contact by Email") == (
         "Determine HubSpot Contact Path"
     )
-    assert first_target(workflow, "Sanitize HubSpot Result") == "Route by Priority"
+    assert first_target(workflow, "Sanitize HubSpot Result") == (
+        "Generate Lead Response Draft"
+    )
 
 
 def test_hubspot_search_uses_email_as_the_unique_lookup_key() -> None:
