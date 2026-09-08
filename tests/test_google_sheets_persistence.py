@@ -61,8 +61,9 @@ def test_google_sheets_append_is_between_postgres_and_priority_routing() -> None
         "Sanitize Google Sheets Result"
     )
     assert first_target(workflow, "Sanitize Google Sheets Result") == (
-        "Route by Priority"
+        "Sync HubSpot Only After Persistence"
     )
+    assert first_target(workflow, "Sanitize HubSpot Result") == "Route by Priority"
 
 
 def test_google_sheets_maps_the_postgres_timestamp_and_required_fields() -> None:

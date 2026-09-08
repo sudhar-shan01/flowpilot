@@ -4,7 +4,8 @@ FlowPilot is a portfolio-grade, AI-powered business workflow automation platform
 
 This repository currently contains **Phase 1: the AI Lead Analysis API**,
 **Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
-persistence**, and **Phase 3B: Google Sheets persistence**.
+persistence**, **Phase 3B: Google Sheets persistence**, and **Phase 4: HubSpot
+CRM contact synchronization**.
 
 ## Business problem
 
@@ -14,7 +15,8 @@ FlowPilot turns a validated lead submission into a predictable, structured
 analysis. Phase 2 adds a real workflow entry point that routes the result by
 priority without duplicating AI logic outside the API. Phase 3A records each
 successfully validated lead and analysis in PostgreSQL. Phase 3B appends that
-same stored lead to Google Sheets before priority routing.
+same stored lead to Google Sheets. Phase 4 then synchronizes a HubSpot contact
+by email before priority routing.
 
 ## Current capabilities
 
@@ -33,6 +35,8 @@ same stored lead to Google Sheets before priority routing.
 - Version-controlled database schema with range and enum-like constraints
 - Google Sheets persistence using the PostgreSQL-generated timestamp
 - Sanitized `PERSISTENCE_ERROR` webhook responses when either persistence step fails
+- HubSpot contact lookup with explicit create and update paths keyed by email
+- Sanitized `CRM_ERROR` responses when CRM synchronization fails
 
 ## Architecture
 
@@ -53,7 +57,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2, 3A, and 3B extend this architecture without changing the Phase 1 API:
+Phases 2 through 4 extend this architecture without changing the Phase 1 API:
 
 ```text
 Webhook caller
@@ -67,6 +71,9 @@ n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
                                                     ▼
                                            Google Sheets row
                                                     │ appended
+                                                    ▼
+                                    HubSpot contact lookup/sync
+                                                    │ synchronized
                                                     ▼
                                       Priority switch (high/medium/low)
                                                     │
@@ -94,11 +101,12 @@ flowpilot/
 ├── tests/
 │   ├── conftest.py
 │   ├── e2e_flowpilot_app.py
+│   ├── test_google_sheets_persistence.py
 │   ├── test_health.py
+│   ├── test_hubspot_crm.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
-│   ├── test_postgres_persistence.py
-│   └── test_google_sheets_persistence.py
+│   └── test_postgres_persistence.py
 ├── n8n/
 │   └── flowpilot-lead-workflow.json
 ├── postgres/
@@ -201,14 +209,15 @@ the Phase 3A and 3B nodes before routing.
 2. Open **Workflows**, choose **Import from File**, and select
    `n8n/flowpilot-lead-workflow.json`.
 3. Review the **Analyze Lead with FlowPilot** HTTP Request node.
-4. Configure the PostgreSQL and Google Sheets nodes as described below.
+4. Configure the PostgreSQL, Google Sheets, and HubSpot nodes as described below.
 5. Save and activate the workflow to register its production webhook.
 
 The export is inactive by design so importing it cannot unexpectedly expose a
 webhook. It contains reference metadata for credentials named
-`FlowPilot PostgreSQL` and `FlowPilot Google Sheets`, but no credential payload,
-token, password, database address, or spreadsheet ID. Create or select both
-local credentials before activation as described below.
+`FlowPilot PostgreSQL`, `FlowPilot Google Sheets`, and `FlowPilot HubSpot`, but
+no credential payload, token, password, database address, or spreadsheet ID.
+Create or select all three local credentials before activation as described
+below.
 
 ### Start FlowPilot
 
@@ -506,6 +515,99 @@ Automated tests require no Google account, credential, network access, or live
 spreadsheet. A live append test requires a user-authorized local Google Sheets
 credential.
 
+## Phase 4: HubSpot CRM contact synchronization
+
+Phase 4 adds a HubSpot Contact sync after both persistence steps succeed and
+before priority routing. It manages Contacts only: no HubSpot Company, Deal,
+pipeline, ticket, marketing, or email objects are created.
+
+```text
+PostgreSQL saved → Google Sheets appended → HubSpot contact search by email
+                                                   │
+                              existing contact ────┴──── missing contact
+                                      │                         │
+                                    update                    create
+                                      └───────────┬─────────────┘
+                                                  ▼
+                                          Priority routing
+```
+
+### Configure the HubSpot credential
+
+1. In n8n, create a **HubSpot OAuth2 API** credential named
+   `FlowPilot HubSpot`.
+2. Connect the intended HubSpot account and grant contact read/write access.
+3. Select that credential in **Search HubSpot Contact by Email**,
+   **Update HubSpot Contact**, and **Create HubSpot Contact**.
+4. Save and activate the workflow only after all three nodes show the local
+   credential as connected.
+
+The contact flow uses HubSpot's supported CRM v3 search, create, and update
+endpoints through n8n HTTP Request nodes with the predefined HubSpot credential.
+The built-in HubSpot contact node exposes a combined upsert rather than the
+explicit update/create paths required for this phase.
+
+### Lookup and field mapping
+
+The search uses the lead's validated `email` as an exact equality filter and
+requests at most one contact. A match supplies the HubSpot contact ID only to the
+internal update request; no match selects the create request. Repeated leads
+with the same email therefore update the existing Contact instead of creating a
+duplicate.
+
+FlowPilot maps only standard Contact properties:
+
+- `email` from the lead email
+- `firstname` from the first component of the trimmed lead name
+- `lastname` from the remaining name components, omitted when there are none
+- `company` from the lead company name
+
+No missing values are invented, no custom properties are created, and AI
+analysis fields remain in PostgreSQL and Google Sheets.
+
+### CRM failure and partial-success behavior
+
+The existing persistence failure behavior remains unchanged:
+
+- PostgreSQL failure bypasses both Google Sheets and HubSpot.
+- Google Sheets failure bypasses HubSpot.
+- A HubSpot search, create, update, authorization, or unexpected-response
+  failure returns HTTP `503` with this sanitized body:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "CRM_ERROR",
+    "message": "Lead was persisted but could not be synchronized with CRM."
+  }
+}
+```
+
+HubSpot response bodies, contact IDs, tokens, account details, API URLs, stack
+traces, and credential data are never included in webhook responses. If HubSpot
+fails, the PostgreSQL row and Google Sheets row remain; Phase 4 performs no
+rollback. Retries, compensation, recovery workflows, and broader deduplication
+remain scoped to Phase 8.
+
+On success, the webhook response still contains only `success`, `route`,
+`message`, and `analysis`. The HubSpot contact ID remains internal.
+
+### Manual verification
+
+Configure the existing PostgreSQL and Google Sheets steps, connect the local
+`FlowPilot HubSpot` credential, activate the workflow, and send the Phase 2
+example request. Confirm a HubSpot Contact is created with the mapped fields.
+Send the same email again with an updated name or company and confirm the same
+Contact is updated rather than duplicated, then verify the public webhook
+response retains its existing shape.
+
+Automated tests require no HubSpot account, credential, or network access. A
+live sync requires a user-authorized HubSpot credential and is optional when one
+is not already available locally. The workflow export contains only credential
+reference metadata; OAuth tokens, private-app tokens, client secrets, portal
+IDs, and other account data must remain in n8n and must never be committed.
+
 ## Run tests
 
 ```powershell
@@ -520,7 +622,7 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 2 (complete):** n8n webhook integration
 - **Phase 3A (complete):** PostgreSQL persistence
 - **Phase 3B (complete):** Google Sheets persistence
-- **Phase 4 (pending):** CRM integration
+- **Phase 4 (complete):** HubSpot CRM contact synchronization
 - **Phase 5 (pending):** Email notifications and AI-generated draft responses
 - **Phase 6 (pending):** Human approval workflow
 - **Phase 7 (pending):** Automated follow-ups
@@ -528,4 +630,4 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 3B until it has been reviewed and approved.
+Development stops at Phase 4 until it has been reviewed and approved.

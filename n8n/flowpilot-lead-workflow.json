@@ -1,5 +1,5 @@
 {
-  "name": "FlowPilot - Lead Intake, PostgreSQL and Google Sheets Persistence, and Priority Routing",
+  "name": "FlowPilot - Lead Intake, Persistence, HubSpot CRM, and Priority Routing",
   "nodes": [
     {
       "parameters": {
@@ -406,6 +406,257 @@
                 },
                 "conditions": [
                   {
+                    "id": "9ba5ae57-6f5c-413d-8bc1-b19aae8f14e2",
+                    "leftValue": "={{ $json.success === true && $json.created_at ? 'ready' : 'error' }}",
+                    "rightValue": "ready",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "ready"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "13785a9a-a3f1-4d27-b52d-c5647d7be884",
+      "name": "Sync HubSpot Only After Persistence",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1480,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const persisted = $json;\nconst parts = String(persisted.lead.name ?? '').trim().split(/\\s+/).filter(Boolean);\nconst firstname = parts.shift() ?? '';\nconst lastname = parts.join(' ');\n\nreturn [{\n  json: {\n    ...persisted,\n    crmContact: {\n      email: persisted.lead.email,\n      firstname,\n      lastname,\n      company: persisted.lead.company,\n    },\n  },\n}];"
+      },
+      "id": "bc82d89b-8bdb-4a62-9078-e16096fe6ef8",
+      "name": "Prepare HubSpot Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: $json.crmContact.email }] }], properties: ['email', 'firstname', 'lastname', 'company'], limit: 1 }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "cc37fe29-5f07-43ce-85a7-3803f613784a",
+      "name": "Search HubSpot Contact by Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        20
+      ],
+      "credentials": {
+        "hubspotOAuth2Api": {
+          "id": "43d9a6de-aeb2-47ee-ad91-1c9448f3dc19",
+          "name": "FlowPilot HubSpot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $json;\nconst prepared = $('Prepare HubSpot Contact').item.json;\nconst statusCode = Number(response.statusCode ?? 0);\n\nconst crmError = () => [{\n  json: {\n    success: false,\n    statusCode: 503,\n    error: {\n      code: 'CRM_ERROR',\n      message: 'Lead was persisted but could not be synchronized with CRM.',\n    },\n  },\n}];\n\nif (statusCode < 200 || statusCode >= 300) {\n  return crmError();\n}\n\nconst result = response.body;\nif (!result || typeof result !== 'object' || !Array.isArray(result.results)) {\n  return crmError();\n}\n\nif (result.results.length === 0) {\n  return [{\n    json: {\n      ...prepared,\n      crmContact: { ...prepared.crmContact, action: 'create' },\n    },\n  }];\n}\n\nconst contactId = result.results[0]?.id;\nif (!contactId) {\n  return crmError();\n}\n\nreturn [{\n  json: {\n    ...prepared,\n    crmContact: {\n      ...prepared.crmContact,\n      action: 'update',\n      contactId: String(contactId),\n    },\n  },\n}];"
+      },
+      "id": "cc524e89-8551-4f56-a23f-ab753242cc55",
+      "name": "Determine HubSpot Contact Path",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f09b0314-1037-4841-a2b7-a14252ae1d55",
+                    "leftValue": "={{ $json.crmContact?.action ?? 'error' }}",
+                    "rightValue": "update",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "update"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3b507e93-274c-4fc0-842b-8fa252df15db",
+                    "leftValue": "={{ $json.crmContact?.action ?? 'error' }}",
+                    "rightValue": "create",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "create"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "4e96872a-b324-4fd1-9042-e80376238b90",
+      "name": "Choose HubSpot Create or Update",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2440,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{$json.crmContact.contactId}}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { email: $json.crmContact.email, firstname: $json.crmContact.firstname, ...($json.crmContact.lastname ? { lastname: $json.crmContact.lastname } : {}), company: $json.crmContact.company } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "28bfbb7e-e09c-458f-aadc-9ff8e5445e62",
+      "name": "Update HubSpot Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2680,
+        -80
+      ],
+      "credentials": {
+        "hubspotOAuth2Api": {
+          "id": "43d9a6de-aeb2-47ee-ad91-1c9448f3dc19",
+          "name": "FlowPilot HubSpot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { email: $json.crmContact.email, firstname: $json.crmContact.firstname, ...($json.crmContact.lastname ? { lastname: $json.crmContact.lastname } : {}), company: $json.crmContact.company } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "b6cf11e0-5c50-4b38-8999-2717d4b17715",
+      "name": "Create HubSpot Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2680,
+        120
+      ],
+      "credentials": {
+        "hubspotOAuth2Api": {
+          "id": "43d9a6de-aeb2-47ee-ad91-1c9448f3dc19",
+          "name": "FlowPilot HubSpot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $json;\nconst prepared = $('Determine HubSpot Contact Path').item.json;\nconst statusCode = Number(response.statusCode ?? 0);\nconst result = response.body;\n\nif (statusCode < 200 || statusCode >= 300 || !result || typeof result !== 'object' || !result.id) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'CRM_ERROR',\n        message: 'Lead was persisted but could not be synchronized with CRM.',\n      },\n    },\n  }];\n}\n\nconst { crmContact, ...workflowData } = prepared;\nreturn [{ json: workflowData }];"
+      },
+      "id": "8c895a95-b5a7-40ba-8bb5-3a26a85129e3",
+      "name": "Sanitize HubSpot Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2920,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
                     "id": "ad60f3db-17f5-4a08-a977-d602961b9b19",
                     "leftValue": "={{ $json.analysis.priority }}",
                     "rightValue": "high",
@@ -479,7 +730,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        1480,
+        3160,
         20
       ]
     },
@@ -509,7 +760,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1720,
+        3400,
         -160
       ]
     },
@@ -539,7 +790,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1720,
+        3400,
         0
       ]
     },
@@ -569,7 +820,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1720,
+        3400,
         160
       ]
     },
@@ -586,7 +837,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1960,
+        3640,
         0
       ]
     },
@@ -603,7 +854,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1720,
+        3160,
         340
       ]
     }
@@ -727,6 +978,115 @@
       "main": [
         [
           {
+            "node": "Sync HubSpot Only After Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync HubSpot Only After Persistence": {
+      "main": [
+        [
+          {
+            "node": "Prepare HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Search HubSpot Contact by Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search HubSpot Contact by Email": {
+      "main": [
+        [
+          {
+            "node": "Determine HubSpot Contact Path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine HubSpot Contact Path": {
+      "main": [
+        [
+          {
+            "node": "Choose HubSpot Create or Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choose HubSpot Create or Update": {
+      "main": [
+        [
+          {
+            "node": "Update HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Sanitize HubSpot Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Sanitize HubSpot Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize HubSpot Result": {
+      "main": [
+        [
+          {
             "node": "Route by Priority",
             "type": "main",
             "index": 0
@@ -804,7 +1164,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "b568a817-8e6f-4e02-8c0f-24b850c3b3a6",
+  "versionId": "b79e4daf-83fb-4a20-89a2-13bc1325d695",
   "meta": {
     "templateCredsSetupCompleted": true
   },
