@@ -1,0 +1,459 @@
+{
+  "name": "FlowPilot - Automated Follow-ups",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "phase7-node-1",
+      "name": "Hourly Follow-up Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH due AS (\n  SELECT id\n  FROM leads\n  WHERE followup_status = 'scheduled'\n    AND followup_due_at <= NOW()\n    AND followup_due_at >= initial_response_sent_at + INTERVAL '72 hours'\n    AND draft_status = 'approved'\n    AND initial_response_sent_at IS NOT NULL\n    AND followup_sent_at IS NULL\n    AND email ~ '^[A-Za-z0-9.!#$%&''*+/=?^_`{|}~-]+@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'\n  ORDER BY followup_due_at, id\n  LIMIT 20\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE leads AS lead\nSET followup_status = 'sending',\n    followup_claimed_at = NOW()\nFROM due\nWHERE lead.id = due.id\n  AND lead.followup_status = 'scheduled'\nRETURNING lead.id::text AS lead_id, lead.name, lead.email,\n          lead.followup_claimed_at::text AS claim_time;",
+        "options": {
+          "queryBatching": "independently"
+        }
+      },
+      "id": "phase7-node-2",
+      "name": "Atomically Claim Due Follow-ups",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -660,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const row = $json;\nconst validId = typeof row.lead_id === 'string' && /^[1-9]\\d*$/.test(row.lead_id);\nif (row.error || !validId || typeof row.claim_time !== 'string' || !Number.isFinite(Date.parse(row.claim_time))) {\n  return { json: { outcome: 'claim_error', error: { code: 'FOLLOWUP_ERROR', message: 'Follow-up work could not be claimed.' } } };\n}\nconst identity = { leadId: row.lead_id, claimTime: row.claim_time };\nconst addressPattern = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;\nconst recipient = typeof row.email === 'string' ? row.email : '';\nconst sender = String($env.FLOWPILOT_LEAD_EMAIL_FROM ?? '');\nif (!addressPattern.test(recipient) || !addressPattern.test(sender) || /[\\r\\n]/.test(recipient + sender)) {\n  return { json: { ...identity, outcome: 'failed', error: { code: 'FOLLOWUP_EMAIL_ERROR', message: 'The follow-up email could not be sent.' } } };\n}\n// A fixed greeting avoids embedding arbitrary stored text in email content.\nreturn { json: { ...identity, outcome: 'ready', email: {\n  sender, recipient,\n  subject: 'Following up on our previous message',\n  body: \"Hello,\\n\\nJust following up on our previous email. If you'd like to continue the conversation, feel free to reply when convenient.\",\n} } };"
+      },
+      "id": "phase7-node-3",
+      "name": "Prepare Follow-up Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "phase7-rule-3",
+                    "leftValue": "={{ $json.outcome === 'ready' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "yes"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "phase7-node-4",
+      "name": "Send Only Valid Follow-up",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -180,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $json.email.sender }}",
+        "toEmail": "={{ $json.email.recipient }}",
+        "subject": "={{ $json.email.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.email.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "phase7-node-5",
+      "name": "Send Follow-up Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        60,
+        0
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "flowpilot-email-credential",
+          "name": "FlowPilot Email"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const prepared = $('Prepare Follow-up Email').item.json;\nconst result = $json;\nconst accepted = Array.isArray(result.accepted) && result.accepted.some(address => typeof address === 'string' && address.toLowerCase() === prepared.email.recipient.toLowerCase());\nconst sent = !result.error && result.success !== false && accepted && (!Array.isArray(result.rejected) || result.rejected.length === 0);\nreturn { json: { leadId: prepared.leadId, claimTime: prepared.claimTime, outcome: sent ? 'sent' : 'failed' } };"
+      },
+      "id": "phase7-node-6",
+      "name": "Sanitize Follow-up SMTP Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "phase7-rule-6",
+                    "leftValue": "={{ $json.outcome === 'sent' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "yes"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "phase7-node-7",
+      "name": "Record Only Successful Follow-up",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'sent', followup_sent_at = NOW()\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING id\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [$json.leadId, $json.claimTime] }}"
+        }
+      },
+      "id": "phase7-node-8",
+      "name": "Mark Follow-up Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        780,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'failed'\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING id\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [$json.leadId, $json.claimTime] }}"
+        }
+      },
+      "id": "phase7-node-9",
+      "name": "Mark Follow-up Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        780,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "phase7-rule-9",
+                    "leftValue": "={{ $json.outcome === 'failed' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "yes"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "phase7-node-10",
+      "name": "Record Only Claimed Failure",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const row = $json;\nif (row.error || !(row.recorded === true || row.recorded === 'true')) {\n  return { json: { outcome: 'error', error: { code: 'FOLLOWUP_STATE_ERROR', message: 'The follow-up result could not be recorded.' } } };\n}\nreturn { json: { outcome: 'recorded' } };"
+      },
+      "id": "phase7-node-11",
+      "name": "Sanitize Follow-up State Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return { json: { outcome: 'error', error: { code: 'FOLLOWUP_ERROR', message: 'Follow-up work could not be claimed.' } } };"
+      },
+      "id": "phase7-node-12",
+      "name": "Sanitized Claim Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Hourly Follow-up Schedule": {
+      "main": [
+        [
+          {
+            "node": "Atomically Claim Due Follow-ups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atomically Claim Due Follow-ups": {
+      "main": [
+        [
+          {
+            "node": "Prepare Follow-up Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Follow-up Email": {
+      "main": [
+        [
+          {
+            "node": "Send Only Valid Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Only Valid Follow-up": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Only Claimed Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-up Email": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Follow-up SMTP Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Follow-up SMTP Result": {
+      "main": [
+        [
+          {
+            "node": "Record Only Successful Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Only Successful Follow-up": {
+      "main": [
+        [
+          {
+            "node": "Mark Follow-up Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Follow-up Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Only Claimed Failure": {
+      "main": [
+        [
+          {
+            "node": "Mark Follow-up Failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitized Claim Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Follow-up Sent": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Follow-up State Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Follow-up Failed": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Follow-up State Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "active": false,
+  "id": "flowpilotPhase7Followups",
+  "tags": []
+}

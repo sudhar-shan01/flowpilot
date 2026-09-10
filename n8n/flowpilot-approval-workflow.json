@@ -318,7 +318,7 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "WITH recorded AS (\n  UPDATE leads\n  SET initial_response_sent_at = NOW()\n  WHERE id = $1\n    AND draft_status = 'approved'\n    AND initial_response_sent_at IS NULL\n  RETURNING id, initial_response_sent_at\n)\nSELECT\n  EXISTS (SELECT 1 FROM recorded) AS recorded,\n  (SELECT id FROM recorded) AS id,\n  (SELECT initial_response_sent_at FROM recorded) AS initial_response_sent_at;",
+        "query": "WITH recorded AS (\n  UPDATE leads\n  SET initial_response_sent_at = NOW(),\n      followup_status = CASE WHEN followup_status IS NULL THEN 'scheduled' ELSE followup_status END,\n      followup_due_at = CASE WHEN followup_status IS NULL THEN NOW() + INTERVAL '72 hours' ELSE followup_due_at END\n  WHERE id = $1\n    AND draft_status = 'approved'\n    AND initial_response_sent_at IS NULL\n    AND email ~ '^[A-Za-z0-9.!#$%&''*+/=?^_`{|}~-]+@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'\n  RETURNING id, initial_response_sent_at\n)\nSELECT\n  EXISTS (SELECT 1 FROM recorded) AS recorded,\n  (SELECT id FROM recorded) AS id,\n  (SELECT initial_response_sent_at FROM recorded) AS initial_response_sent_at;",
         "options": {
           "queryReplacement": "={{ [$json.leadId] }}"
         }

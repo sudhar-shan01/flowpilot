@@ -6,7 +6,8 @@ This repository currently contains **Phase 1: the AI Lead Analysis API**,
 **Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
 persistence**, **Phase 3B: Google Sheets persistence**, **Phase 4: HubSpot
 CRM contact synchronization**, and **Phase 5: internal email notifications and
-AI-generated response drafts**, and **Phase 6: secure human approval**.
+AI-generated response drafts**, **Phase 6: secure human approval**, and
+**Phase 7: one scheduled follow-up**.
 
 ## Business problem
 
@@ -141,18 +142,22 @@ flowpilot/
 │   ├── test_hubspot_crm.py
 │   ├── test_email_drafts_workflow.py
 │   ├── test_human_approval_workflow.py
+│   ├── test_followup_workflow.py
+│   ├── integration/test_followup_postgres.py
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
 │   └── test_postgres_persistence.py
 ├── n8n/
 │   ├── flowpilot-lead-workflow.json
-│   └── flowpilot-approval-workflow.json
+│   ├── flowpilot-approval-workflow.json
+│   └── flowpilot-followup-workflow.json
 ├── postgres/
 │   └── init/
 │       ├── 001_create_leads.sql
 │       ├── 002_add_lead_drafts.sql
-│       └── 003_add_human_approval.sql
+│       ├── 003_add_human_approval.sql
+│       └── 004_add_followups.sql
 ├── compose.postgres.yml
 ├── .env.example
 ├── .gitignore
@@ -857,6 +862,116 @@ confirm that no second decision or email is possible. Live SMTP verification is
 optional when no local credential is available; the automated suite is
 network-free and credential-free.
 
+## Phase 7: Automated follow-ups
+
+Exactly one deterministic follow-up is scheduled 72 hours after the successful
+initial response is recorded. The due timestamp is exact; delivery occurs on
+the next hourly run, subject to the 20-row batch limit and service availability.
+
+```text
+Initial SMTP success → atomic timestamp + follow-up scheduling
+Hourly Schedule Trigger → atomic claim of up to 20 due rows
+→ validate persisted recipient/configured sender → plain-text SMTP
+→ mark same claim sent or failed
+```
+
+Migration `postgres/init/004_add_followups.sql` adds nullable `followup_status`,
+`followup_due_at`, `followup_claimed_at`, and `followup_sent_at`. It runs in a
+transaction, preserves rows, supports reruns, and indexes scheduled due work.
+The database permits only `scheduled`, `sending`, `sent`, `failed`, `cancelled`,
+or NULL. Legacy rows remain NULL; there is no automatic backfill.
+
+The approval workflow records `initial_response_sent_at` and schedules the
+follow-up in one update, reached only after initial SMTP success. PostgreSQL's
+transaction-stable `NOW()` makes the due time exactly 72 hours later. Existing
+follow-up states, including cancellation, are preserved. Initial SMTP failure
+never reaches this update. If SMTP succeeds but this update fails, the existing
+truthful error response remains and reconciliation is deferred to Phase 8.
+
+The claim uses one `WITH ... UPDATE ... RETURNING` statement with
+`FOR UPDATE SKIP LOCKED`, ordered by due time and ID, limited to 20 rows.
+Only scheduled, due, approved leads with a recorded initial send and a valid
+persisted mailbox can transition to `sending`. A second concurrent transaction
+skips locked rows. Subsequent runs exclude sending, sent, failed, cancelled,
+future, pending, rejected, unsent, and legacy rows. Result updates require both
+the same lead ID and claim timestamp, with status still `sending`.
+
+The email uses the fixed subject `Following up on our previous message` and a
+short plain-text greeting inviting a reply. No AI, customer-supplied headers,
+pricing, deadlines, or new claims are used. The recipient comes only from the
+claimed PostgreSQL row and is validated again before SMTP. Phase 7 deliberately
+accepts single ASCII mailbox addresses, not display-name lists or international
+mailboxes. The sender comes from `FLOWPILOT_LEAD_EMAIL_FROM`; SMTP uses the local
+`FlowPilot Email` credential. No sender address or credential payload is exported.
+
+Confirmed SMTP acceptance records `sent` and `followup_sent_at`. SMTP or sender
+validation failure records `failed`, leaving the initial response and approval
+state unchanged. Errors are sanitized to `FOLLOWUP_ERROR`,
+`FOLLOWUP_EMAIL_ERROR`, or `FOLLOWUP_STATE_ERROR` as appropriate. Raw node errors
+may still exist in restricted n8n execution logs; they are not forwarded in
+result messages. No automatic retry is configured.
+
+A crash or a result-update failure can leave a row `sending`, including when
+SMTP may already have accepted the message. Do not reset or replay such work
+automatically: Phase 8 will define reconciliation and recovery. SMTP acceptance
+does not prove inbox delivery, and database/SMTP cannot provide an atomic
+exactly-once transaction. Manual n8n retries or state resets can duplicate mail.
+
+There is no inbound reply detection. An operator can suppress a scheduled
+follow-up before it is claimed using a parameterized query:
+
+```sql
+UPDATE leads SET followup_status = 'cancelled'
+WHERE id = $1 AND followup_status = 'scheduled';
+```
+
+Check that one row was updated. A zero-row result may mean the scheduler already
+claimed it; cancelling cannot recall an in-flight email. No dashboard or inbound
+mail integration is included.
+
+### Configure and verify Phase 7
+
+1. Apply all migrations to a new local database, or apply `004` to the existing
+   database before activating the updated approval workflow:
+
+   ```powershell
+   docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/004_add_followups.sql'
+   ```
+
+2. Import all three JSON files from `n8n/` into n8n `2.37.10`. Reselect your
+   local `FlowPilot PostgreSQL` credential on every PostgreSQL node and
+   `FlowPilot Email` on email nodes. Set `FLOWPILOT_LEAD_EMAIL_FROM` in n8n's
+   environment, then activate the workflows. The scheduler uses UTC hourly runs.
+3. With a controlled test recipient, approve and send an initial response.
+   Verify `scheduled` and a due time exactly 72 hours after the sent timestamp.
+   Rejection, pending approval, and initial SMTP failure must not schedule work.
+4. In an isolated test database, seed due/future/cancelled examples and execute
+   the scheduler. Verify only due eligible rows send, no more than 20 are claimed,
+   and running again cannot reclaim sending/sent/failed/cancelled rows. Do not
+   manipulate production timestamps to accelerate a demo.
+5. Simulate SMTP failure with mocks: the row becomes failed, never automatically
+   scheduled again. A stopped execution after claiming remains sending.
+
+Automated Code-node tests execute the committed JavaScript with Node.js; they
+use no network, SMTP credentials, or sleeps. Install Node.js in addition to the
+Python dependencies. Optional PostgreSQL execution tests run the exact committed
+SQL, including two overlapping claim transactions, migration reruns, status
+constraints, and the 72-hour boundary, against a disposable container:
+
+```powershell
+docker run -d --name flowpilot-phase7-test --network none -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17-alpine
+# Wait for pg_isready to report accepting connections before running tests.
+docker exec flowpilot-phase7-test pg_isready -U postgres
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase7-test'
+python -m pytest tests/integration/test_followup_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+docker rm -f -v flowpilot-phase7-test
+```
+
+Use only a disposable test container: these tests create and remove their own
+isolated schemas. No ports are published and the container has no network.
+The normal suite skips these optional database tests when the variable is unset.
+
 ## Run tests
 
 ```powershell
@@ -874,9 +989,9 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 4 (complete):** HubSpot CRM contact synchronization
 - **Phase 5 (complete):** Email notifications and AI-generated draft responses
 - **Phase 6 (complete):** Human approval workflow
-- **Phase 7 (pending):** Automated follow-ups
+- **Phase 7 (complete):** One automated follow-up after 72 hours
 - **Phase 8 (pending):** Retries, deduplication, observability, and workflow reliability
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 6 until it has been reviewed and approved.
+Development stops at Phase 7 until it has been reviewed and approved.
