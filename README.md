@@ -6,7 +6,7 @@ This repository currently contains **Phase 1: the AI Lead Analysis API**,
 **Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
 persistence**, **Phase 3B: Google Sheets persistence**, **Phase 4: HubSpot
 CRM contact synchronization**, and **Phase 5: internal email notifications and
-AI-generated response drafts**.
+AI-generated response drafts**, and **Phase 6: secure human approval**.
 
 ## Business problem
 
@@ -19,7 +19,8 @@ successfully validated lead and analysis in PostgreSQL. Phase 3B appends that
 same stored lead to Google Sheets. Phase 4 then synchronizes a HubSpot contact
 by email. Phase 5 generates and persists a plain-text response draft for human
 approval and sends the configured team recipient an internal notification
-before priority routing.
+before priority routing. Phase 6 adds expiring approve/reject links and sends
+the exact stored draft to the stored lead email only after a guarded approval.
 
 ## Current capabilities
 
@@ -44,6 +45,10 @@ before priority routing.
 - PostgreSQL draft persistence with `pending_approval` status
 - Internal SMTP notification through the `FlowPilot Email` n8n credential
 - Sanitized `DRAFT_ERROR` and `EMAIL_ERROR` partial-success responses
+- Cryptographically unpredictable, single-use approval tokens with a 48-hour lifetime
+- Atomic `pending_approval` to `approved` or `rejected` state transitions
+- Approved lead email sourced only from the persisted recipient, subject, and body
+- Browser-friendly approval results with sanitized failure responses
 
 ## Architecture
 
@@ -64,7 +69,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 through 5 extend this architecture without changing the public webhook
+Phases 2 through 6 extend this architecture without changing the public webhook
 success contract:
 
 ```text
@@ -86,16 +91,29 @@ n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
                                       POST /lead/draft
                                                     │ validated
                                                     ▼
-                                    Persist pending response draft
+                              Persist pending draft + approval token
                                                     │ saved
                                                     ▼
-                                      Internal email notification
+                                Internal email with approve/reject links
                                                     │ sent
                                                     ▼
                                       Priority switch (high/medium/low)
                                                     │
                                                     ▼
                                           Clean webhook response
+
+Separate approval workflow:
+
+Human link → GET review page (format validation only; no side effects)
+                                           │ explicit human confirmation
+                                           ▼
+              POST decision → Validate ID/token/decision
+                                           → Atomic PostgreSQL transition
+                                           ├─ rejected → Browser confirmation
+                                           └─ approved → Load stored draft/recipient
+                                                        → Plain-text lead email
+                                                        → Record sent timestamp
+                                                        → Browser confirmation
 ```
 
 ## Project structure
@@ -122,15 +140,19 @@ flowpilot/
 │   ├── test_health.py
 │   ├── test_hubspot_crm.py
 │   ├── test_email_drafts_workflow.py
+│   ├── test_human_approval_workflow.py
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
 │   └── test_postgres_persistence.py
 ├── n8n/
-│   └── flowpilot-lead-workflow.json
+│   ├── flowpilot-lead-workflow.json
+│   └── flowpilot-approval-workflow.json
 ├── postgres/
 │   └── init/
-│       └── 001_create_leads.sql
+│       ├── 001_create_leads.sql
+│       ├── 002_add_lead_drafts.sql
+│       └── 003_add_human_approval.sql
 ├── compose.postgres.yml
 ├── .env.example
 ├── .gitignore
@@ -659,8 +681,9 @@ It returns only `subject` and `body`. Both are revalidated after the provider
 call. Subjects must be a single line and no longer than 160 characters; bodies
 are limited to 2,000 characters. Empty values, extra fields, malformed output,
 and HTML-like content are rejected. The provider prompt forbids invented
-pricing, discounts, timelines, promises, capabilities, recipients, names, and
-signatures. Drafts remain plain text and require human approval in Phase 6.
+    pricing, discounts, timelines, promises, capabilities, recipients, names, and
+    signatures. Drafts remain plain text and require the Phase 6 human approval
+    workflow before delivery.
 
 ### Draft persistence
 
@@ -718,6 +741,122 @@ and the lead receives no email. Live SMTP verification is optional when no
 credential is available; all automated tests remain network-free and
 credential-free.
 
+## Phase 6: Human approval workflow
+
+Phase 6 keeps draft generation and approval separate. The lead-intake workflow
+creates a PostgreSQL UUID token only after a valid draft has been stored as
+`pending_approval`. Its internal notification contains Approve and Reject links.
+The focused workflow at `n8n/flowpilot-approval-workflow.json` validates an
+emailed link and renders a confirmation page without changing state. Only the
+human's explicit POST confirmation can perform the PostgreSQL transition. A
+lead email is sent only on the successfully authorized approved path.
+
+### Database migration and states
+
+`postgres/init/003_add_human_approval.sql` additively creates nullable
+`approval_token`, `approval_expires_at`, `approval_decided_at`, and
+`initial_response_sent_at` columns. It also expands the draft-status constraint
+to permit only `pending_approval`, `approved`, or `rejected` (plus `NULL` for
+legacy leads), and creates a unique partial index for non-null tokens. The
+migration uses `IF NOT EXISTS` and preserves existing rows.
+
+New PostgreSQL volumes apply all migrations automatically. Apply the migration
+to an existing volume without recreating the database:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/003_add_human_approval.sql'
+```
+
+Allowed transitions are deliberately one-way:
+
+```text
+pending_approval → approved
+pending_approval → rejected
+```
+
+The GET review webhook performs only strict format validation and returns a
+minimal HTML form. It has no path to PostgreSQL, email, AI, or any other
+external side effect, so mail scanners, link previews, browser prefetching, and
+repeated GET requests cannot consume a token or decide a draft. The token is
+carried in a hidden form field and is not displayed on the confirmation page.
+
+Only the POST decision webhook is connected to the state-changing query. That
+query requires the same lead ID and token, a
+`pending_approval` status, an unexpired timestamp, and an exact `approve` or
+`reject` decision. It clears the token in the same atomic update. Approved and
+rejected rows cannot transition again, so a repeated or alternate-link click
+has no side effect. Links expire 48 hours after creation; no scheduler is
+required.
+
+### Configure and import approval
+
+1. Import both `n8n/flowpilot-lead-workflow.json` and
+   `n8n/flowpilot-approval-workflow.json` into n8n `2.37.10`.
+2. Reselect the local `FlowPilot PostgreSQL` credential on every PostgreSQL
+   node in both workflows. Exported credential IDs are references, not secrets,
+   and differ between n8n instances.
+3. Reselect the local `FlowPilot Email` SMTP credential on **Send Internal
+   Notification** and **Send Persisted Draft to Lead**.
+4. Set `FLOWPILOT_APPROVAL_URL` in the n8n environment to the approval
+   workflow's production webhook URL, for example
+   `https://n8n.example.com/webhook/flowpilot/approval`. Do not include query
+   parameters, credentials, or a fragment.
+5. Set `FLOWPILOT_LEAD_EMAIL_FROM` to a sender address allowed by the SMTP
+   account. Keep the existing internal recipient/sender variables configured.
+6. Restart n8n after changing its environment, then activate both workflows.
+
+The internal notification links send only `lead_id`, `token`, and `decision` to
+the GET review webhook. The resulting page requires an explicit human POST of
+those same three fields. Both boundaries reject missing, blank, malformed,
+extra, or unsupported fields. The POST never accepts a recipient, subject,
+body, company, or AI content.
+On approval, PostgreSQL supplies the recipient and the exact stored
+`draft_subject` and `draft_body`; the workflow neither calls AI nor regenerates
+or edits the draft. Sender addresses are validated before either email node.
+
+### Approval results and failures
+
+- **Approved:** atomically set `approved`, clear the token, send the persisted
+  plain-text draft to the persisted lead email, record
+  `initial_response_sent_at`, then show a success confirmation.
+- **Rejected:** atomically set `rejected`, set `approval_decided_at`, clear the
+  token, retain the draft for audit, send no lead email, and show a rejection
+  confirmation.
+- **Invalid, expired, mismatched, legacy, or used link:** change nothing, send
+  nothing, and return the same generic browser response without confirming
+  whether a lead exists.
+- **Approval/database/setup failure:** return a sanitized `APPROVAL_ERROR`
+  internally and a generic browser response. SQL errors, hosts, IDs, tokens,
+  credentials, lead data, and provider responses are not exposed.
+- **SMTP failure after approval:** keep the row `approved`, leave
+  `initial_response_sent_at` null, and truthfully report that the email was not
+  sent. The token remains invalidated, so automatic retry/recovery is deferred
+  to Phase 8 rather than risking a duplicate send.
+
+If the email succeeds but recording its timestamp fails, the browser receives a
+generic completion error while the row remains approved. Operators must inspect
+the n8n execution and reconcile the timestamp manually; reliable retry and
+reconciliation infrastructure remains Phase 8 work.
+
+### Local manual demo
+
+Apply migration `003`, configure the two local credentials and four email/link
+environment variables, and activate both workflows. Submit the documented lead
+webhook request, then confirm the row has a non-null token, a 48-hour expiry,
+and `pending_approval`. Open one internal-email link and confirm the review page
+alone leaves the row and token unchanged. Then press its confirmation button:
+
+- Approve: confirm one lead email exactly matches the persisted subject/body,
+  the status is `approved`, the token is null, and the sent timestamp is set.
+- Reject: confirm the status is `rejected`, the token is null, the draft remains,
+  and the lead receives no email.
+
+Repeatedly open either emailed GET link before confirming and verify the row
+remains `pending_approval`. After one POST decision, open either link again and
+confirm that no second decision or email is possible. Live SMTP verification is
+optional when no local credential is available; the automated suite is
+network-free and credential-free.
+
 ## Run tests
 
 ```powershell
@@ -734,10 +873,10 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 3B (complete):** Google Sheets persistence
 - **Phase 4 (complete):** HubSpot CRM contact synchronization
 - **Phase 5 (complete):** Email notifications and AI-generated draft responses
-- **Phase 6 (pending):** Human approval workflow
+- **Phase 6 (complete):** Human approval workflow
 - **Phase 7 (pending):** Automated follow-ups
 - **Phase 8 (pending):** Retries, deduplication, observability, and workflow reliability
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 5 until it has been reviewed and approved.
+Development stops at Phase 6 until it has been reviewed and approved.

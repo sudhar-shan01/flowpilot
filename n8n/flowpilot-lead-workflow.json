@@ -227,6 +227,38 @@
     },
     {
       "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH issued AS (\n  UPDATE leads\n  SET approval_token = gen_random_uuid(),\n      approval_expires_at = NOW() + INTERVAL '48 hours',\n      approval_decided_at = NULL,\n      initial_response_sent_at = NULL\n  WHERE id = $1\n    AND draft_status = 'pending_approval'\n    AND NULLIF(BTRIM(draft_subject), '') IS NOT NULL\n    AND NULLIF(BTRIM(draft_body), '') IS NOT NULL\n  RETURNING id, approval_token, approval_expires_at\n)\nSELECT\n  EXISTS (SELECT 1 FROM issued) AS issued,\n  (SELECT id FROM issued) AS id,\n  (SELECT approval_token::text FROM issued) AS approval_token,\n  (SELECT approval_expires_at FROM issued) AS approval_expires_at;",
+        "options": {
+          "queryReplacement": "={{ [$json.lead_id] }}"
+        }
+      },
+      "id": "01d3831f-2980-4cce-a864-0aa291007976",
+      "name": "Create Approval Token",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [4360, 0],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $json;\nconst prepared = $('Sanitize Draft Persistence').item.json;\nconst issued = row.issued === true || row.issued === 'true';\nconst token = typeof row.approval_token === 'string' ? row.approval_token.toLowerCase() : '';\nconst uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\n\nif (row.error || !issued || Number(row.id) !== Number(prepared.lead_id) || !uuidPattern.test(token) || !row.approval_expires_at) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'APPROVAL_ERROR',\n        message: 'Lead was processed but an approval request could not be created.',\n      },\n    },\n  }];\n}\n\nreturn [{\n  json: {\n    ...prepared,\n    approval: { token, expires_at: row.approval_expires_at },\n  },\n}];"
+      },
+      "id": "2b75d6cb-9f70-4623-91c0-f7824c981769",
+      "name": "Sanitize Approval Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4600, 0]
+    },
+    {
+      "parameters": {
         "rules": {
           "values": [
             {
@@ -240,7 +272,7 @@
                 "conditions": [
                   {
                     "id": "9cafc693-3d50-4c93-931b-340692f06886",
-                    "leftValue": "={{ $json.success === true && $json.draft?.status === 'pending_approval' }}",
+                    "leftValue": "={{ $json.success === true && $json.draft?.status === 'pending_approval' && Boolean($json.approval?.token) }}",
                     "rightValue": true,
                     "operator": {
                       "type": "boolean",
@@ -265,20 +297,20 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        4360,
+        4840,
         0
       ]
     },
     {
       "parameters": {
-        "jsCode": "const data = $json;\nconst recipient = String($env.FLOWPILOT_INTERNAL_EMAIL_TO ?? '').trim();\nconst validRecipient = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(recipient);\n\nif (!validRecipient) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst notificationBody = [\n  'A lead has completed FlowPilot processing.',\n  '',\n  `Name: ${data.lead.name}`,\n  `Email: ${data.lead.email}`,\n  `Company: ${data.lead.company}`,\n  `Budget: ${data.lead.budget}`,\n  `Priority: ${data.analysis.priority}`,\n  `Lead score: ${data.analysis.lead_score}`,\n  `Summary: ${data.analysis.short_summary}`,\n  `Recommended action: ${data.analysis.recommended_action}`,\n  '',\n  'Pending lead-response draft',\n  `Subject: ${data.draft.subject}`,\n  '',\n  data.draft.body,\n].join('\\n');\n\nreturn [{\n  json: {\n    ...data,\n    notification: {\n      recipient,\n      subject: `FlowPilot ${data.analysis.priority}-priority lead notification`,\n      body: notificationBody,\n    },\n  },\n}];"
+        "jsCode": "const data = $json;\nconst recipient = String($env.FLOWPILOT_INTERNAL_EMAIL_TO ?? '').trim();\nconst sender = String($env.FLOWPILOT_INTERNAL_EMAIL_FROM ?? '').trim();\nconst approvalBase = String($env.FLOWPILOT_APPROVAL_URL ?? '').trim();\nconst addressPattern = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nlet baseUrl;\ntry {\n  baseUrl = new URL(approvalBase);\n} catch {\n  baseUrl = null;\n}\n\nconst validBaseUrl = baseUrl && ['http:', 'https:'].includes(baseUrl.protocol) && !baseUrl.username && !baseUrl.password && !baseUrl.search && !baseUrl.hash;\nif (!addressPattern.test(recipient) || !addressPattern.test(sender) || !validBaseUrl || !data.approval?.token || !data.lead_id) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst decisionUrl = (decision) => {\n  const url = new URL(baseUrl.toString());\n  url.searchParams.set('lead_id', String(data.lead_id));\n  url.searchParams.set('token', data.approval.token);\n  url.searchParams.set('decision', decision);\n  return url.toString();\n};\n\nconst notificationBody = [\n  'A lead has completed FlowPilot processing.',\n  '',\n  `Name: ${data.lead.name}`,\n  `Email: ${data.lead.email}`,\n  `Company: ${data.lead.company}`,\n  `Budget: ${data.lead.budget}`,\n  `Priority: ${data.analysis.priority}`,\n  `Lead score: ${data.analysis.lead_score}`,\n  `Summary: ${data.analysis.short_summary}`,\n  `Recommended action: ${data.analysis.recommended_action}`,\n  '',\n  'Pending lead-response draft',\n  `Subject: ${data.draft.subject}`,\n  '',\n  data.draft.body,\n  '',\n  'This approval link expires in 48 hours.',\n  `Approve: ${decisionUrl('approve')}`,\n  `Reject: ${decisionUrl('reject')}`,\n].join('\\n');\n\nreturn [{\n  json: {\n    ...data,\n    notification: {\n      recipient,\n      sender,\n      subject: `FlowPilot ${data.analysis.priority}-priority lead notification`,\n      body: notificationBody,\n    },\n  },\n}];"
       },
       "id": "eb8f34c4-2628-43e5-85e4-c3d165bf8d0c",
       "name": "Prepare Internal Notification",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4600,
+        5080,
         0
       ]
     },
@@ -322,7 +354,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        4840,
+        5320,
         0
       ]
     },
@@ -340,7 +372,7 @@
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [
-        5080,
+        5560,
         -20
       ],
       "credentials": {
@@ -353,14 +385,14 @@
     },
     {
       "parameters": {
-        "jsCode": "const emailResult = $json;\nconst prepared = $('Prepare Internal Notification').item.json;\n\nif (emailResult.error || emailResult.success === false) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst { notification, draft, lead_id, ...publicWorkflowData } = prepared;\nreturn [{ json: publicWorkflowData }];"
+        "jsCode": "const emailResult = $json;\nconst prepared = $('Prepare Internal Notification').item.json;\n\nif (emailResult.error || emailResult.success === false) {\n  return [{\n    json: {\n      success: false,\n      statusCode: 503,\n      error: {\n        code: 'EMAIL_ERROR',\n        message: 'Lead was processed but the internal notification could not be sent.',\n      },\n    },\n  }];\n}\n\nconst { notification, draft, approval, lead_id, ...publicWorkflowData } = prepared;\nreturn [{ json: publicWorkflowData }];"
       },
       "id": "da840f9e-cc3e-42bc-994a-94676166495f",
       "name": "Sanitize Email Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        5320,
+        5800,
         -20
       ]
     },
@@ -404,7 +436,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        5560,
+        6040,
         -20
       ]
     },
@@ -1034,7 +1066,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        5800,
+        6280,
         20
       ]
     },
@@ -1064,7 +1096,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        6040,
+        6520,
         -160
       ]
     },
@@ -1094,7 +1126,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        6040,
+        6520,
         0
       ]
     },
@@ -1124,7 +1156,7 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        6040,
+        6520,
         160
       ]
     },
@@ -1141,7 +1173,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        6280,
+        6760,
         0
       ]
     },
@@ -1158,7 +1190,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        5800,
+        6280,
         340
       ]
     }
@@ -1450,6 +1482,28 @@
       ]
     },
     "Sanitize Draft Persistence": {
+      "main": [
+        [
+          {
+            "node": "Create Approval Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Approval Token": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Approval Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Approval Token": {
       "main": [
         [
           {
