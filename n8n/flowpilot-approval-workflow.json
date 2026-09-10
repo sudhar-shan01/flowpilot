@@ -1,0 +1,385 @@
+{
+  "name": "FlowPilot - Human Approval",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "flowpilot/approval",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "130e6a3c-1cb2-44bf-9f0d-c0b2a39726fe",
+      "name": "Approval Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-1160, 120],
+      "webhookId": "687a72a4-f49e-4273-ad39-766681726062"
+    },
+    {
+      "parameters": {
+        "jsCode": "const query = $json.query;\nconst invalid = () => [{ json: { approvalResult: 'invalid', statusCode: 400 } }];\n\nif (!query || typeof query !== 'object' || Array.isArray(query)) {\n  return invalid();\n}\n\nconst allowedFields = new Set(['lead_id', 'token', 'decision']);\nif (Object.keys(query).some((field) => !allowedFields.has(field))) {\n  return invalid();\n}\n\nconst leadIdText = typeof query.lead_id === 'string' ? query.lead_id.trim() : '';\nconst token = typeof query.token === 'string' ? query.token.trim().toLowerCase() : '';\nconst decision = typeof query.decision === 'string' ? query.decision.trim() : '';\nconst uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\n\nif (!/^[1-9]\\d*$/.test(leadIdText) || !uuidPattern.test(token) || !['approve', 'reject'].includes(decision)) {\n  return invalid();\n}\n\nconst leadId = Number(leadIdText);\nif (!Number.isSafeInteger(leadId)) {\n  return invalid();\n}\n\nreturn [{ json: { approvalResult: 'validated', leadId, token, decision } }];"
+      },
+      "id": "1849a17a-bf7f-4e1f-a0b5-5b45752d49df",
+      "name": "Validate Approval Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-940, 120]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [
+                  {
+                    "id": "2a8caead-d8dc-4984-8af1-8c8d08f6f72c",
+                    "leftValue": "={{ $json.approvalResult === 'validated' }}",
+                    "rightValue": true,
+                    "operator": {"type": "boolean", "operation": "true", "singleValue": true}
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "valid"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "f0cbdf6f-8510-4d35-a24a-1940d268912c",
+      "name": "Authorize Only Valid Request",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [-720, 120]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH transitioned AS (\n  UPDATE leads\n  SET draft_status = CASE $3::text\n        WHEN 'approve' THEN 'approved'\n        WHEN 'reject' THEN 'rejected'\n      END,\n      approval_decided_at = NOW(),\n      approval_token = NULL\n  WHERE id = $1\n    AND approval_token = $2::uuid\n    AND draft_status = 'pending_approval'\n    AND approval_expires_at > NOW()\n    AND $3::text IN ('approve', 'reject')\n    AND (\n      $3::text = 'reject'\n      OR (\n        NULLIF(BTRIM(email), '') IS NOT NULL\n        AND NULLIF(BTRIM(draft_subject), '') IS NOT NULL\n        AND NULLIF(BTRIM(draft_body), '') IS NOT NULL\n      )\n    )\n  RETURNING id, email, draft_subject, draft_body, draft_status, approval_decided_at\n)\nSELECT\n  EXISTS (SELECT 1 FROM transitioned) AS authorized,\n  (SELECT id FROM transitioned) AS id,\n  (SELECT email FROM transitioned) AS email,\n  (SELECT draft_subject FROM transitioned) AS draft_subject,\n  (SELECT draft_body FROM transitioned) AS draft_body,\n  (SELECT draft_status FROM transitioned) AS draft_status,\n  (SELECT approval_decided_at FROM transitioned) AS approval_decided_at;",
+        "options": {
+          "queryReplacement": "={{ [$json.leadId, $json.token, $json.decision] }}"
+        }
+      },
+      "id": "13597932-dd00-4c55-99d1-7d831174372a",
+      "name": "Atomically Authorize Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [-480, 40],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $json;\nconst request = $('Validate Approval Request').item.json;\n\nif (row.error) {\n  return [{ json: { approvalResult: 'error', statusCode: 503, error: { code: 'APPROVAL_ERROR', message: 'The approval request could not be processed.' } } }];\n}\n\nconst authorized = row.authorized === true || row.authorized === 'true';\nif (!authorized || !row.id || !['approved', 'rejected'].includes(row.draft_status)) {\n  return [{ json: { approvalResult: 'invalid', statusCode: 400 } }];\n}\n\nif ((request.decision === 'approve' && row.draft_status !== 'approved') || (request.decision === 'reject' && row.draft_status !== 'rejected')) {\n  return [{ json: { approvalResult: 'error', statusCode: 503, error: { code: 'APPROVAL_ERROR', message: 'The approval request could not be processed.' } } }];\n}\n\nif (row.draft_status === 'rejected') {\n  return [{ json: { approvalResult: 'rejected', statusCode: 200 } }];\n}\n\nreturn [{\n  json: {\n    approvalResult: 'approved',\n    statusCode: 200,\n    leadId: Number(row.id),\n    persisted: {\n      recipient: row.email,\n      subject: row.draft_subject,\n      body: row.draft_body,\n    },\n  },\n}];"
+      },
+      "id": "c1fab8b6-3e72-4595-ae0d-586865fd1f55",
+      "name": "Sanitize Authorization Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 40]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "ad3957f3-c15d-47f8-a470-8b87d188a3b0", "leftValue": "={{ $json.approvalResult === 'approved' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "approved"
+            },
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "4c9c725f-a3dd-44ae-90b0-eae6d82cc399", "leftValue": "={{ $json.approvalResult === 'rejected' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "rejected"
+            },
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "4324fc02-9419-4753-815c-f52b1ea8bb92", "leftValue": "={{ $json.approvalResult === 'error' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "error"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "2e08815a-0566-4a12-895f-90d52561ce25",
+      "name": "Route Approval Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [0, 40]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst sender = String($env.FLOWPILOT_LEAD_EMAIL_FROM ?? '').trim();\nconst addressPattern = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst recipient = typeof data.persisted?.recipient === 'string' ? data.persisted.recipient.trim() : '';\nconst subject = typeof data.persisted?.subject === 'string' ? data.persisted.subject : '';\nconst body = typeof data.persisted?.body === 'string' ? data.persisted.body : '';\n\nif (!addressPattern.test(sender) || !addressPattern.test(recipient) || !subject.trim() || !body.trim() || /[\\r\\n]/.test(subject)) {\n  return [{ json: { approvalResult: 'email_error', statusCode: 503, error: { code: 'EMAIL_ERROR', message: 'The draft was approved, but the response email could not be sent.' } } }];\n}\n\nreturn [{\n  json: {\n    approvalResult: 'email_ready',\n    leadId: data.leadId,\n    email: { sender, recipient, subject, body },\n  },\n}];"
+      },
+      "id": "a1b001f8-948a-4e10-afca-b0df9395895d",
+      "name": "Prepare Approved Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, -140]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "fa62ed0a-ad7e-4dde-8c65-920df0662dda", "leftValue": "={{ $json.approvalResult === 'email_ready' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "configured"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "6e16e28c-ee88-40f4-a6e6-86cb4bd7b66b",
+      "name": "Send Only Configured Lead Email",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [480, -140]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $json.email.sender }}",
+        "toEmail": "={{ $json.email.recipient }}",
+        "subject": "={{ $json.email.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.email.body }}",
+        "options": {}
+      },
+      "id": "05e5e032-7073-438f-9781-6e897f836a55",
+      "name": "Send Persisted Draft to Lead",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [720, -180],
+      "credentials": {
+        "smtp": {
+          "id": "flowpilot-email-credential",
+          "name": "FlowPilot Email"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json;\nconst prepared = $('Prepare Approved Email').item.json;\n\nif (result.error || result.success === false) {\n  return [{ json: { approvalResult: 'email_error', statusCode: 503, error: { code: 'EMAIL_ERROR', message: 'The draft was approved, but the response email could not be sent.' } } }];\n}\n\nreturn [{ json: { approvalResult: 'email_sent', leadId: prepared.leadId } }];"
+      },
+      "id": "950a4df9-39c1-48b1-867d-c2ac1e830b8b",
+      "name": "Sanitize Lead Email Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, -180]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "efbf55e5-a8f2-4e5c-8f50-d62a0e5d8178", "leftValue": "={{ $json.approvalResult === 'email_sent' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sent"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "c7feb9ed-2287-48c5-89b3-13d581697d3c",
+      "name": "Record Only Sent Email",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [1200, -180]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH recorded AS (\n  UPDATE leads\n  SET initial_response_sent_at = NOW()\n  WHERE id = $1\n    AND draft_status = 'approved'\n    AND initial_response_sent_at IS NULL\n  RETURNING id, initial_response_sent_at\n)\nSELECT\n  EXISTS (SELECT 1 FROM recorded) AS recorded,\n  (SELECT id FROM recorded) AS id,\n  (SELECT initial_response_sent_at FROM recorded) AS initial_response_sent_at;",
+        "options": {
+          "queryReplacement": "={{ [$json.leadId] }}"
+        }
+      },
+      "id": "3349cc3a-1d51-487a-b217-02076702b79f",
+      "name": "Record Response Sent Timestamp",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [1440, -220],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $json;\nconst recorded = row.recorded === true || row.recorded === 'true';\n\nif (row.error || !recorded || !row.initial_response_sent_at) {\n  return [{ json: { approvalResult: 'error', statusCode: 503, error: { code: 'APPROVAL_ERROR', message: 'The approval request could not be completed.' } } }];\n}\n\nreturn [{ json: { approvalResult: 'complete', statusCode: 200 } }];"
+      },
+      "id": "34983837-c82d-4a07-9fc6-2fe98aedc43a",
+      "name": "Sanitize Sent Timestamp Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, -220]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [{"id": "933f7ced-c59c-4970-b54f-cec3c4cc2afa", "leftValue": "={{ $json.approvalResult === 'complete' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "recorded"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "8c75f261-2fd8-43ae-89e8-96a7495d395b",
+      "name": "Confirm Recorded Send",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [1920, -220]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — Draft approved and response sent.",
+        "options": {"responseCode": 200}
+      },
+      "id": "b041b52a-c9cc-42ba-b818-83c9a7f1e758",
+      "name": "Respond Approved",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [2160, -260]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — Draft rejected. No email was sent.",
+        "options": {"responseCode": 200}
+      },
+      "id": "adbf826d-7700-4db7-9722-4df9a80df4e9",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [240, 40]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — This approval link is invalid, expired, or has already been used.",
+        "options": {"responseCode": 400}
+      },
+      "id": "df7d19ed-84f2-4446-949b-5f2280741cd7",
+      "name": "Respond Invalid Approval",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-480, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — This approval request could not be completed.",
+        "options": {"responseCode": 503}
+      },
+      "id": "e294a038-6a6f-4b13-9a56-e50a05142a42",
+      "name": "Respond Approval Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [240, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — Draft approved, but the response email could not be sent.",
+        "options": {"responseCode": 503}
+      },
+      "id": "2f9869b4-4eab-44ea-b0c4-1f9080bb7dc8",
+      "name": "Respond Email Failure",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1200, 20]
+    }
+  ],
+  "connections": {
+    "Approval Webhook": {"main": [[{"node": "Validate Approval Request", "type": "main", "index": 0}]]},
+    "Validate Approval Request": {"main": [[{"node": "Authorize Only Valid Request", "type": "main", "index": 0}]]},
+    "Authorize Only Valid Request": {
+      "main": [
+        [{"node": "Atomically Authorize Decision", "type": "main", "index": 0}],
+        [{"node": "Respond Invalid Approval", "type": "main", "index": 0}]
+      ]
+    },
+    "Atomically Authorize Decision": {"main": [[{"node": "Sanitize Authorization Result", "type": "main", "index": 0}]]},
+    "Sanitize Authorization Result": {"main": [[{"node": "Route Approval Result", "type": "main", "index": 0}]]},
+    "Route Approval Result": {
+      "main": [
+        [{"node": "Prepare Approved Email", "type": "main", "index": 0}],
+        [{"node": "Respond Rejected", "type": "main", "index": 0}],
+        [{"node": "Respond Approval Error", "type": "main", "index": 0}],
+        [{"node": "Respond Invalid Approval", "type": "main", "index": 0}]
+      ]
+    },
+    "Prepare Approved Email": {"main": [[{"node": "Send Only Configured Lead Email", "type": "main", "index": 0}]]},
+    "Send Only Configured Lead Email": {
+      "main": [
+        [{"node": "Send Persisted Draft to Lead", "type": "main", "index": 0}],
+        [{"node": "Respond Email Failure", "type": "main", "index": 0}]
+      ]
+    },
+    "Send Persisted Draft to Lead": {"main": [[{"node": "Sanitize Lead Email Result", "type": "main", "index": 0}]]},
+    "Sanitize Lead Email Result": {"main": [[{"node": "Record Only Sent Email", "type": "main", "index": 0}]]},
+    "Record Only Sent Email": {
+      "main": [
+        [{"node": "Record Response Sent Timestamp", "type": "main", "index": 0}],
+        [{"node": "Respond Email Failure", "type": "main", "index": 0}]
+      ]
+    },
+    "Record Response Sent Timestamp": {"main": [[{"node": "Sanitize Sent Timestamp Result", "type": "main", "index": 0}]]},
+    "Sanitize Sent Timestamp Result": {"main": [[{"node": "Confirm Recorded Send", "type": "main", "index": 0}]]},
+    "Confirm Recorded Send": {
+      "main": [
+        [{"node": "Respond Approved", "type": "main", "index": 0}],
+        [{"node": "Respond Approval Error", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {"executionOrder": "v1"},
+  "active": false,
+  "versionId": "f51c0a17-e939-4b12-a3d5-ccf6d43468a8",
+  "meta": {"templateCredsSetupCompleted": true},
+  "id": "flowpilotPhase6Approval",
+  "tags": []
+}
