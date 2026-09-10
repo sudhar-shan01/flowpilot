@@ -76,7 +76,7 @@ def test_existing_contact_updates_and_missing_contact_creates() -> None:
     assert [output[0]["node"] for output in outputs] == [
         "Update HubSpot Contact",
         "Create HubSpot Contact",
-        "Respond Error",
+        "Prepare Idempotency Failure",
     ]
 
     update = nodes["Update HubSpot Contact"]["parameters"]
@@ -117,10 +117,10 @@ def test_previous_persistence_failures_bypass_hubspot() -> None:
     assert "$json.success === true" in condition
     assert "$json.created_at" in condition
     assert first_target(workflow, gate_name, 0) == "Prepare HubSpot Contact"
-    assert first_target(workflow, gate_name, 1) == "Respond Error"
+    assert first_target(workflow, gate_name, 1) == "Prepare Idempotency Failure"
     assert first_target(
         workflow, "Persist to Google Sheets Only After PostgreSQL", 1
-    ) == "Respond Error"
+    ) == "Prepare Idempotency Failure"
 
 
 def test_hubspot_failures_return_only_sanitized_crm_error() -> None:
