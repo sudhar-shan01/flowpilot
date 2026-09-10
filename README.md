@@ -104,7 +104,11 @@ n8n Webhook → Prepare Lead → POST /lead/analyze → Validate result
 
 Separate approval workflow:
 
-Human link → Validate ID/token/decision → Atomic PostgreSQL transition
+Human link → GET review page (format validation only; no side effects)
+                                           │ explicit human confirmation
+                                           ▼
+              POST decision → Validate ID/token/decision
+                                           → Atomic PostgreSQL transition
                                            ├─ rejected → Browser confirmation
                                            └─ approved → Load stored draft/recipient
                                                         → Plain-text lead email
@@ -742,9 +746,10 @@ credential-free.
 Phase 6 keeps draft generation and approval separate. The lead-intake workflow
 creates a PostgreSQL UUID token only after a valid draft has been stored as
 `pending_approval`. Its internal notification contains Approve and Reject links.
-The focused workflow at `n8n/flowpilot-approval-workflow.json` validates a link,
-performs the state transition in PostgreSQL, and sends a lead email only on the
-approved path.
+The focused workflow at `n8n/flowpilot-approval-workflow.json` validates an
+emailed link and renders a confirmation page without changing state. Only the
+human's explicit POST confirmation can perform the PostgreSQL transition. A
+lead email is sent only on the successfully authorized approved path.
 
 ### Database migration and states
 
@@ -769,7 +774,14 @@ pending_approval → approved
 pending_approval → rejected
 ```
 
-The state-changing query requires the same lead ID and token, a
+The GET review webhook performs only strict format validation and returns a
+minimal HTML form. It has no path to PostgreSQL, email, AI, or any other
+external side effect, so mail scanners, link previews, browser prefetching, and
+repeated GET requests cannot consume a token or decide a draft. The token is
+carried in a hidden form field and is not displayed on the confirmation page.
+
+Only the POST decision webhook is connected to the state-changing query. That
+query requires the same lead ID and token, a
 `pending_approval` status, an unexpired timestamp, and an exact `approve` or
 `reject` decision. It clears the token in the same atomic update. Approved and
 rejected rows cannot transition again, so a repeated or alternate-link click
@@ -793,9 +805,11 @@ required.
    account. Keep the existing internal recipient/sender variables configured.
 6. Restart n8n after changing its environment, then activate both workflows.
 
-The internal notification links send only `lead_id`, `token`, and `decision`.
-The approval webhook rejects missing, blank, malformed, extra, or unsupported
-fields. It never accepts a recipient, subject, body, company, or AI content.
+The internal notification links send only `lead_id`, `token`, and `decision` to
+the GET review webhook. The resulting page requires an explicit human POST of
+those same three fields. Both boundaries reject missing, blank, malformed,
+extra, or unsupported fields. The POST never accepts a recipient, subject,
+body, company, or AI content.
 On approval, PostgreSQL supplies the recipient and the exact stored
 `draft_subject` and `draft_body`; the workflow neither calls AI nor regenerates
 or edits the draft. Sender addresses are validated before either email node.
@@ -829,17 +843,19 @@ reconciliation infrastructure remains Phase 8 work.
 Apply migration `003`, configure the two local credentials and four email/link
 environment variables, and activate both workflows. Submit the documented lead
 webhook request, then confirm the row has a non-null token, a 48-hour expiry,
-and `pending_approval`. Use one internal-email link:
+and `pending_approval`. Open one internal-email link and confirm the review page
+alone leaves the row and token unchanged. Then press its confirmation button:
 
 - Approve: confirm one lead email exactly matches the persisted subject/body,
   the status is `approved`, the token is null, and the sent timestamp is set.
 - Reject: confirm the status is `rejected`, the token is null, the draft remains,
   and the lead receives no email.
 
-Click either link again and confirm the generic invalid/expired/used response
-appears with no second email. Live SMTP verification is optional when no local
-credential is available; the automated suite is network-free and
-credential-free.
+Repeatedly open either emailed GET link before confirming and verify the row
+remains `pending_approval`. After one POST decision, open either link again and
+confirm that no second decision or email is possible. Live SMTP verification is
+optional when no local credential is available; the automated suite is
+network-free and credential-free.
 
 ## Run tests
 

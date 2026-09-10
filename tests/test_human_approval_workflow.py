@@ -39,6 +39,26 @@ def reachable(workflow: dict[str, object], source: str) -> set[str]:
     return seen
 
 
+def paths_to(
+    workflow: dict[str, object], source: str, target: str
+) -> list[list[str]]:
+    connections = workflow["connections"]
+    paths: list[list[str]] = []
+
+    def visit(current: str, path: list[str]) -> None:
+        if current == target:
+            paths.append(path)
+            return
+        for output in connections.get(current, {}).get("main", []):
+            for connection in output:
+                name = connection["node"]
+                if name not in path:
+                    visit(name, [*path, name])
+
+    visit(source, [source])
+    return paths
+
+
 def apply_guarded_decision(
     row: dict[str, object], *, token: str, decision: str, unexpired: bool = True
 ) -> bool:
@@ -120,18 +140,179 @@ def test_internal_notification_uses_configured_approve_and_reject_links() -> Non
     assert "$env.FLOWPILOT_INTERNAL_EMAIL_FROM" in prepare
 
 
-def test_approval_webhook_accepts_only_the_authorization_fields() -> None:
+def test_get_approval_link_cannot_reach_atomic_decision() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    webhook = nodes["Approval Review Webhook"]
+
+    assert webhook["parameters"]["path"] == "flowpilot/approval"
+    assert webhook["parameters"]["httpMethod"] == "GET"
+    assert "Atomically Authorize Decision" not in reachable(
+        workflow, "Approval Review Webhook"
+    )
+
+
+def test_get_approval_link_cannot_reach_lead_email() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+
+    assert "Send Persisted Draft to Lead" not in reachable(
+        workflow, "Approval Review Webhook"
+    )
+
+
+def test_get_approval_link_cannot_mutate_postgres() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    get_nodes = {
+        "Approval Review Webhook",
+        *reachable(workflow, "Approval Review Webhook"),
+    }
+
+    assert not any(
+        nodes[name]["type"] == "n8n-nodes-base.postgres" for name in get_nodes
+    )
+    assert not any(
+        nodes[name]["type"] == "n8n-nodes-base.emailSend" for name in get_nodes
+    )
+    assert not any(
+        nodes[name]["type"] == "n8n-nodes-base.httpRequest" for name in get_nodes
+    )
+
+
+def test_get_approval_link_cannot_consume_the_token() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    get_nodes = {
+        "Approval Review Webhook",
+        *reachable(workflow, "Approval Review Webhook"),
+    }
+    get_definition = json.dumps([nodes[name] for name in sorted(get_nodes)])
+
+    assert "approval_token = NULL" not in get_definition
+    assert "UPDATE leads" not in get_definition
+
+
+def test_get_approval_link_cannot_change_draft_status() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    get_nodes = {
+        "Approval Review Webhook",
+        *reachable(workflow, "Approval Review Webhook"),
+    }
+    get_definition = json.dumps([nodes[name] for name in sorted(get_nodes)])
+
+    assert "draft_status" not in get_definition
+
+
+def test_get_approval_link_cannot_set_approval_decided_at() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    get_nodes = {
+        "Approval Review Webhook",
+        *reachable(workflow, "Approval Review Webhook"),
+    }
+    get_definition = json.dumps([nodes[name] for name in sorted(get_nodes)])
+
+    assert "approval_decided_at" not in get_definition
+
+
+def test_repeated_get_scanner_prefetch_has_no_side_effects() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    lead = {
+        "draft_status": "pending_approval",
+        "approval_token": "7cc78a01-2ce0-4f4f-88dc-ec577453f635",
+        "approval_decided_at": None,
+        "initial_response_sent_at": None,
+    }
+    before = lead.copy()
+
+    for _ in range(3):
+        get_nodes = {
+            "Approval Review Webhook",
+            *reachable(workflow, "Approval Review Webhook"),
+        }
+        assert not any(
+            nodes[name]["type"]
+            in {
+                "n8n-nodes-base.postgres",
+                "n8n-nodes-base.emailSend",
+                "n8n-nodes-base.httpRequest",
+            }
+            for name in get_nodes
+        )
+        assert first_target(workflow, "Prepare Review Confirmation") == (
+            "Respond Review Confirmation"
+        )
+
+    assert lead == before
+
+
+def test_get_review_page_requires_an_explicit_post_and_hides_the_token() -> None:
     nodes = nodes_by_name(load_workflow(APPROVAL_WORKFLOW_PATH))
-    webhook = nodes["Approval Webhook"]
+    prepare = nodes["Prepare Review Confirmation"]["parameters"]["jsCode"]
+    response = nodes["Respond Review Confirmation"]["parameters"]
+
+    assert "<form method='post' action='?'" in prepare
+    assert "type='hidden' name='lead_id'" in prepare
+    assert "type='hidden' name='token'" in prepare
+    assert "type='hidden' name='decision'" in prepare
+    assert "No change has been made yet" in prepare
+    assert "${data.token}" in prepare
+    assert "token" not in prepare.split("<main>", 1)[1].split("<form", 1)[0].lower()
+    headers = response["options"]["responseHeaders"]["entries"]
+    assert {header["name"]: header["value"] for header in headers}["Content-Type"] == (
+        "text/html; charset=utf-8"
+    )
+
+
+def test_get_review_validates_only_basic_authorization_fields() -> None:
+    nodes = nodes_by_name(load_workflow(APPROVAL_WORKFLOW_PATH))
+    validator = nodes["Validate Review Request"]["parameters"]["jsCode"]
+
+    assert "$json.query" in validator
+    assert "new Set(['lead_id', 'token', 'decision'])" in validator
+    assert "Object.keys(query).some" in validator
+    assert "query.lead_id === 'string'" in validator
+    assert "query.token === 'string'" in validator
+    assert "uuidPattern.test(token)" in validator
+    assert "['approve', 'reject'].includes(decision)" in validator
+    for forbidden in ("subject", "recipient", "company", "draft_body"):
+        assert forbidden not in validator
+
+
+def test_only_post_can_reach_the_atomic_decision_node() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    nodes = nodes_by_name(workflow)
+    webhooks = [
+        name
+        for name, node in nodes.items()
+        if node["type"] == "n8n-nodes-base.webhook"
+    ]
+
+    assert webhooks == ["Approval Review Webhook", "Approval Decision Webhook"]
+    assert "Atomically Authorize Decision" not in reachable(
+        workflow, "Approval Review Webhook"
+    )
+    assert "Atomically Authorize Decision" in reachable(
+        workflow, "Approval Decision Webhook"
+    )
+    assert nodes["Approval Decision Webhook"]["parameters"]["httpMethod"] == "POST"
+
+
+def test_post_approval_webhook_accepts_only_the_authorization_fields() -> None:
+    nodes = nodes_by_name(load_workflow(APPROVAL_WORKFLOW_PATH))
+    webhook = nodes["Approval Decision Webhook"]
     validator = nodes["Validate Approval Request"]["parameters"]["jsCode"]
 
     assert webhook["parameters"]["path"] == "flowpilot/approval"
-    assert webhook["parameters"].get("httpMethod", "GET") == "GET"
+    assert webhook["parameters"]["httpMethod"] == "POST"
     assert webhook["parameters"]["responseMode"] == "responseNode"
     assert "new Set(['lead_id', 'token', 'decision'])" in validator
-    assert "Object.keys(query).some" in validator
+    assert "Object.keys(body).some" in validator
+    assert "Object.keys(query).length > 0" in validator
+    assert "$json.body" in validator
     assert "$json.query" in validator
-    assert "$json.body" not in validator
     for forbidden in ("subject", "recipient", "company", "draft_body"):
         assert forbidden not in validator
 
@@ -141,13 +322,32 @@ def test_request_validation_covers_missing_blank_and_malformed_values() -> None:
         "Validate Approval Request"
     ]["parameters"]["jsCode"]
 
-    assert "query.lead_id === 'string'" in validator
-    assert "query.token === 'string'" in validator
+    assert "body.lead_id === 'string'" in validator
+    assert "body.token === 'string'" in validator
     assert ".trim()" in validator
     assert "/^[1-9]\\d*$/" in validator
     assert "uuidPattern.test(token)" in validator
     assert "['approve', 'reject'].includes(decision)" in validator
     assert "Number.isSafeInteger(leadId)" in validator
+
+
+def test_post_approve_reaches_email_only_after_atomic_authorization() -> None:
+    workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
+    paths = paths_to(
+        workflow, "Approval Decision Webhook", "Send Persisted Draft to Lead"
+    )
+
+    assert paths
+    for path in paths:
+        assert path.index("Atomically Authorize Decision") < path.index(
+            "Send Persisted Draft to Lead"
+        )
+        assert path.index("Route Approval Result") < path.index(
+            "Send Persisted Draft to Lead"
+        )
+    assert first_target(workflow, "Route Approval Result", 0) == (
+        "Prepare Approved Email"
+    )
 
 
 def test_decision_transition_is_atomic_parameterized_and_single_use() -> None:

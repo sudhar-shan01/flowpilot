@@ -9,17 +9,115 @@
         "options": {}
       },
       "id": "130e6a3c-1cb2-44bf-9f0d-c0b2a39726fe",
-      "name": "Approval Webhook",
+      "name": "Approval Review Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2.1,
-      "position": [-1160, 120],
+      "position": [-1160, -420],
       "webhookId": "687a72a4-f49e-4273-ad39-766681726062"
     },
     {
       "parameters": {
-        "jsCode": "const query = $json.query;\nconst invalid = () => [{ json: { approvalResult: 'invalid', statusCode: 400 } }];\n\nif (!query || typeof query !== 'object' || Array.isArray(query)) {\n  return invalid();\n}\n\nconst allowedFields = new Set(['lead_id', 'token', 'decision']);\nif (Object.keys(query).some((field) => !allowedFields.has(field))) {\n  return invalid();\n}\n\nconst leadIdText = typeof query.lead_id === 'string' ? query.lead_id.trim() : '';\nconst token = typeof query.token === 'string' ? query.token.trim().toLowerCase() : '';\nconst decision = typeof query.decision === 'string' ? query.decision.trim() : '';\nconst uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\n\nif (!/^[1-9]\\d*$/.test(leadIdText) || !uuidPattern.test(token) || !['approve', 'reject'].includes(decision)) {\n  return invalid();\n}\n\nconst leadId = Number(leadIdText);\nif (!Number.isSafeInteger(leadId)) {\n  return invalid();\n}\n\nreturn [{ json: { approvalResult: 'validated', leadId, token, decision } }];"
+        "jsCode": "const query = $json.query;\nconst invalid = () => [{ json: { reviewResult: 'invalid', statusCode: 400 } }];\n\nif (!query || typeof query !== 'object' || Array.isArray(query)) {\n  return invalid();\n}\n\nconst allowedFields = new Set(['lead_id', 'token', 'decision']);\nif (Object.keys(query).some((field) => !allowedFields.has(field))) {\n  return invalid();\n}\n\nconst leadIdText = typeof query.lead_id === 'string' ? query.lead_id.trim() : '';\nconst token = typeof query.token === 'string' ? query.token.trim().toLowerCase() : '';\nconst decision = typeof query.decision === 'string' ? query.decision.trim() : '';\nconst uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\n\nif (!/^[1-9]\\d*$/.test(leadIdText) || !uuidPattern.test(token) || !['approve', 'reject'].includes(decision)) {\n  return invalid();\n}\n\nconst leadId = Number(leadIdText);\nif (!Number.isSafeInteger(leadId)) {\n  return invalid();\n}\n\nreturn [{ json: { reviewResult: 'validated', leadId, token, decision } }];"
       },
       "id": "1849a17a-bf7f-4e1f-a0b5-5b45752d49df",
+      "name": "Validate Review Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-940, -420]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+                "conditions": [
+                  {
+                    "id": "53f9d94d-9bfd-4b5d-9773-2742e6091a66",
+                    "leftValue": "={{ $json.reviewResult === 'validated' }}",
+                    "rightValue": true,
+                    "operator": {"type": "boolean", "operation": "true", "singleValue": true}
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "valid"
+            }
+          ]
+        },
+        "options": {"fallbackOutput": "extra"}
+      },
+      "id": "aaaf261e-72b8-4587-8cc0-68ad1f1fe175",
+      "name": "Show Only Valid Review",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [-720, -420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst actionLabel = data.decision === 'approve' ? 'Approve draft' : 'Reject draft';\nconst actionDescription = data.decision === 'approve'\n  ? 'Approve this saved response draft and send it to the lead.'\n  : 'Reject this saved response draft. No email will be sent.';\nconst reviewHtml = `<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>FlowPilot confirmation</title><style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1.25rem;color:#172033}main{border:1px solid #d8dee9;border-radius:12px;padding:2rem;box-shadow:0 8px 28px rgba(23,32,51,.08)}h1{font-size:1.5rem;margin-top:0}p{line-height:1.5}button{border:0;border-radius:8px;padding:.8rem 1.1rem;font:inherit;font-weight:650;color:#fff;background:#2457d6;cursor:pointer}</style></head><body><main><h1>Confirm ${actionLabel.toLowerCase()}</h1><p>${actionDescription}</p><p>No change has been made yet. Continue only if you intended this decision.</p><form method='post' action='?' autocomplete='off'><input type='hidden' name='lead_id' value='${data.leadId}'><input type='hidden' name='token' value='${data.token}'><input type='hidden' name='decision' value='${data.decision}'><button type='submit'>${actionLabel}</button></form></main></body></html>`;\nreturn [{ json: { reviewHtml } }];"
+      },
+      "id": "b087ced1-9394-4acf-ad79-a7781c03fc43",
+      "name": "Prepare Review Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-480, -500]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.reviewHtml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {"name": "Content-Type", "value": "text/html; charset=utf-8"},
+              {"name": "Cache-Control", "value": "no-store"},
+              {"name": "Referrer-Policy", "value": "no-referrer"},
+              {"name": "Content-Security-Policy", "value": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}
+            ]
+          }
+        }
+      },
+      "id": "3c97ec22-4322-439d-ac3a-9a270f5a8d89",
+      "name": "Respond Review Confirmation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-240, -500]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "FlowPilot — This approval link is invalid.",
+        "options": {"responseCode": 400}
+      },
+      "id": "f6bef9bc-061b-4240-b3fa-791576ac1f8f",
+      "name": "Respond Invalid Review",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-480, -340]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "flowpilot/approval",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "5c25c74e-2d7d-4ca4-9b76-75e0b3a6e10c",
+      "name": "Approval Decision Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-1160, 120],
+      "webhookId": "d46f7a2b-3f18-4d1a-a570-f5a1b23467c8"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body;\nconst query = $json.query;\nconst invalid = () => [{ json: { approvalResult: 'invalid', statusCode: 400 } }];\n\nif (!body || typeof body !== 'object' || Array.isArray(body)) {\n  return invalid();\n}\nif (query && (typeof query !== 'object' || Array.isArray(query) || Object.keys(query).length > 0)) {\n  return invalid();\n}\n\nconst allowedFields = new Set(['lead_id', 'token', 'decision']);\nif (Object.keys(body).some((field) => !allowedFields.has(field))) {\n  return invalid();\n}\n\nconst leadIdText = typeof body.lead_id === 'string' ? body.lead_id.trim() : '';\nconst token = typeof body.token === 'string' ? body.token.trim().toLowerCase() : '';\nconst decision = typeof body.decision === 'string' ? body.decision.trim() : '';\nconst uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\n\nif (!/^[1-9]\\d*$/.test(leadIdText) || !uuidPattern.test(token) || !['approve', 'reject'].includes(decision)) {\n  return invalid();\n}\n\nconst leadId = Number(leadIdText);\nif (!Number.isSafeInteger(leadId)) {\n  return invalid();\n}\n\nreturn [{ json: { approvalResult: 'validated', leadId, token, decision } }];"
+      },
+      "id": "7b620ff3-dd1a-4a2f-b4f1-ad0dd36efe1c",
       "name": "Validate Approval Request",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -333,7 +431,16 @@
     }
   ],
   "connections": {
-    "Approval Webhook": {"main": [[{"node": "Validate Approval Request", "type": "main", "index": 0}]]},
+    "Approval Review Webhook": {"main": [[{"node": "Validate Review Request", "type": "main", "index": 0}]]},
+    "Validate Review Request": {"main": [[{"node": "Show Only Valid Review", "type": "main", "index": 0}]]},
+    "Show Only Valid Review": {
+      "main": [
+        [{"node": "Prepare Review Confirmation", "type": "main", "index": 0}],
+        [{"node": "Respond Invalid Review", "type": "main", "index": 0}]
+      ]
+    },
+    "Prepare Review Confirmation": {"main": [[{"node": "Respond Review Confirmation", "type": "main", "index": 0}]]},
+    "Approval Decision Webhook": {"main": [[{"node": "Validate Approval Request", "type": "main", "index": 0}]]},
     "Validate Approval Request": {"main": [[{"node": "Authorize Only Valid Request", "type": "main", "index": 0}]]},
     "Authorize Only Valid Request": {
       "main": [
