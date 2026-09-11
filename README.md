@@ -7,8 +7,9 @@ This repository currently contains **Phase 1: the AI Lead Analysis API**,
 persistence**, **Phase 3B: Google Sheets persistence**, **Phase 4: HubSpot
 CRM contact synchronization**, and **Phase 5: internal email notifications and
 AI-generated response drafts**, **Phase 6: secure human approval**, and
-**Phase 7: one scheduled follow-up**, and **Phase 8A: inbound idempotency and
-duplicate-request protection**.
+**Phase 7: one scheduled follow-up**, **Phase 8A: inbound idempotency and
+duplicate-request protection**, and **Phase 8B1: email recovery and
+uncertain-send reconciliation**.
 
 ## Business problem
 
@@ -25,7 +26,9 @@ before priority routing. Phase 6 adds expiring approve/reject links and sends
 the exact stored draft to the stored lead email only after a guarded approval.
 Phase 7 schedules one fixed follow-up 72 hours after a successful initial
 response. Phase 8A adds an explicit, atomic idempotency boundary before any
-lead-processing side effect.
+lead-processing side effect. Phase 8B1 adds durable email delivery claims,
+conservative SMTP outcome classification, and a database-only recovery sweep
+that quarantines stale sends instead of retrying them.
 
 ## Current capabilities
 
@@ -57,7 +60,10 @@ lead-processing side effect.
 - Optional Idempotency-Key protection at the n8n webhook boundary
 - Atomic PostgreSQL ownership for concurrent duplicate requests
 - Sanitized completed-response replay without repeating business side effects
-- Conservative processing and failed duplicate handling for Phase 8B recovery
+- Atomic ownership before initial-response and follow-up SMTP attempts
+- Durable `sending`, `sent`, `failed`, and `uncertain` email delivery states
+- Hourly PostgreSQL-only quarantine of delivery claims stale for 30 minutes
+- No automatic replay of uncertain email sends
 
 ## Architecture
 
@@ -78,7 +84,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 through 8A extend this architecture without changing the public webhook
+Phases 2 through 8B1 extend this architecture without changing the public webhook
 success contract:
 
 ```text
@@ -124,10 +130,19 @@ Human link → GET review page (format validation only; no side effects)
               POST decision → Validate ID/token/decision
                                            → Atomic PostgreSQL transition
                                            ├─ rejected → Browser confirmation
-                                           └─ approved → Load stored draft/recipient
+                                           └─ approved → Atomic initial-email claim
+                                                        → Load stored draft/recipient
                                                         → Plain-text lead email
-                                                        → Record sent timestamp
-                                                        → Browser confirmation
+                                                        → Guarded delivery state update
+                                                        ├─ sent → timestamp + schedule follow-up
+                                                        ├─ failed → no follow-up
+                                                        └─ uncertain → quarantine, no retry
+
+Hourly recovery workflow:
+
+PostgreSQL Schedule Trigger → stale `sending` claims (30 minutes)
+                            → guarded transition to `uncertain`
+                            → no SMTP, AI, or external API call
 ```
 
 ## Project structure
@@ -157,8 +172,10 @@ flowpilot/
 │   ├── test_human_approval_workflow.py
 │   ├── test_followup_workflow.py
 │   ├── test_idempotency_workflow.py
+│   ├── test_email_recovery_workflow.py
 │   ├── integration/test_followup_postgres.py
 │   ├── integration/test_idempotency_postgres.py
+│   ├── integration/test_email_recovery_postgres.py
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
@@ -166,14 +183,16 @@ flowpilot/
 ├── n8n/
 │   ├── flowpilot-lead-workflow.json
 │   ├── flowpilot-approval-workflow.json
-│   └── flowpilot-followup-workflow.json
+│   ├── flowpilot-followup-workflow.json
+│   └── flowpilot-recovery-workflow.json
 ├── postgres/
 │   └── init/
 │       ├── 001_create_leads.sql
 │       ├── 002_add_lead_drafts.sql
 │       ├── 003_add_human_approval.sql
 │       ├── 004_add_followups.sql
-│       └── 005_add_idempotency.sql
+│       ├── 005_add_idempotency.sql
+│       └── 006_add_email_recovery.sql
 ├── compose.postgres.yml
 ├── .env.example
 ├── .gitignore
@@ -837,9 +856,10 @@ or edits the draft. Sender addresses are validated before either email node.
 
 ### Approval results and failures
 
-- **Approved:** atomically set `approved`, clear the token, send the persisted
-  plain-text draft to the persisted lead email, record
-  `initial_response_sent_at`, then show a success confirmation.
+- **Approved:** atomically set `approved` and clear the approval token, then
+  atomically claim the initial email. Only that claim owner may send the
+  persisted plain-text draft to the persisted lead email. A confirmed SMTP
+  acceptance records `initial_response_sent_at` and schedules the follow-up.
 - **Rejected:** atomically set `rejected`, set `approval_decided_at`, clear the
   token, retain the draft for audit, send no lead email, and show a rejection
   confirmation.
@@ -849,15 +869,16 @@ or edits the draft. Sender addresses are validated before either email node.
 - **Approval/database/setup failure:** return a sanitized `APPROVAL_ERROR`
   internally and a generic browser response. SQL errors, hosts, IDs, tokens,
   credentials, lead data, and provider responses are not exposed.
-- **SMTP failure after approval:** keep the row `approved`, leave
-  `initial_response_sent_at` null, and truthfully report that the email was not
-  sent. The token remains invalidated, so automatic retry/recovery is deferred
-  to Phase 8 rather than risking a duplicate send.
+- **SMTP result after approval:** a proven pre-SMTP validation failure or
+  explicit recipient rejection becomes `failed`. Confirmed acceptance becomes
+  `sent`. A timeout, connection loss, malformed result, missing result, or any
+  outcome where acceptance cannot be proved becomes `uncertain`. All keep the
+  approval transition intact and leave the single-use token invalidated.
 
-If the email succeeds but recording its timestamp fails, the browser receives a
-generic completion error while the row remains approved. Operators must inspect
-the n8n execution and reconcile the timestamp manually; reliable retry and
-reconciliation infrastructure remains Phase 8 work.
+If SMTP accepts the message but the database cannot record that result, the row
+remains `sending`. The recovery workflow later quarantines a stale claim as
+`uncertain`; it never resends it. SMTP acceptance is not proof of inbox delivery,
+and the database and mail server cannot participate in one atomic transaction.
 
 ### Local manual demo
 
@@ -885,7 +906,7 @@ initial response is recorded. The due timestamp is exact; delivery occurs on
 the next hourly run, subject to the 20-row batch limit and service availability.
 
 ```text
-Initial SMTP success → atomic timestamp + follow-up scheduling
+Confirmed initial SMTP acceptance → guarded timestamp + follow-up scheduling
 Hourly Schedule Trigger → atomic claim of up to 20 due rows
 → validate persisted recipient/configured sender → plain-text SMTP
 → mark same claim sent or failed
@@ -894,15 +915,17 @@ Hourly Schedule Trigger → atomic claim of up to 20 due rows
 Migration `postgres/init/004_add_followups.sql` adds nullable `followup_status`,
 `followup_due_at`, `followup_claimed_at`, and `followup_sent_at`. It runs in a
 transaction, preserves rows, supports reruns, and indexes scheduled due work.
-The database permits only `scheduled`, `sending`, `sent`, `failed`, `cancelled`,
-or NULL. Legacy rows remain NULL; there is no automatic backfill.
+Migration `006` expands the database constraint to permit `scheduled`,
+`sending`, `sent`, `failed`, `cancelled`, `uncertain`, or NULL. Legacy rows
+remain NULL; there is no automatic backfill.
 
 The approval workflow records `initial_response_sent_at` and schedules the
-follow-up in one update, reached only after initial SMTP success. PostgreSQL's
+follow-up in one guarded update, reached only after confirmed initial SMTP
+acceptance by the current claim owner. PostgreSQL's
 transaction-stable `NOW()` makes the due time exactly 72 hours later. Existing
 follow-up states, including cancellation, are preserved. Initial SMTP failure
-never reaches this update. If SMTP succeeds but this update fails, the existing
-truthful error response remains and reconciliation is deferred to Phase 8.
+or uncertainty never reaches this update. If SMTP succeeds but this update
+fails, the delivery remains `sending` for conservative recovery.
 
 The claim uses one `WITH ... UPDATE ... RETURNING` statement with
 `FOR UPDATE SKIP LOCKED`, ordered by due time and ID, limited to 20 rows.
@@ -920,18 +943,21 @@ accepts single ASCII mailbox addresses, not display-name lists or international
 mailboxes. The sender comes from `FLOWPILOT_LEAD_EMAIL_FROM`; SMTP uses the local
 `FlowPilot Email` credential. No sender address or credential payload is exported.
 
-Confirmed SMTP acceptance records `sent` and `followup_sent_at`. SMTP or sender
-validation failure records `failed`, leaving the initial response and approval
-state unchanged. Errors are sanitized to `FOLLOWUP_ERROR`,
+Confirmed SMTP acceptance records `sent` and `followup_sent_at`. A proven
+pre-SMTP validation failure or explicit recipient rejection records `failed`.
+Missing, malformed, timeout, connection-loss, and otherwise ambiguous SMTP
+results record `uncertain`, leaving the initial response and approval state
+unchanged. Errors are sanitized to `FOLLOWUP_ERROR`,
 `FOLLOWUP_EMAIL_ERROR`, or `FOLLOWUP_STATE_ERROR` as appropriate. Raw node errors
 may still exist in restricted n8n execution logs; they are not forwarded in
 result messages. No automatic retry is configured.
 
 A crash or a result-update failure can leave a row `sending`, including when
-SMTP may already have accepted the message. Do not reset or replay such work
-automatically: Phase 8 will define reconciliation and recovery. SMTP acceptance
-does not prove inbox delivery, and database/SMTP cannot provide an atomic
-exactly-once transaction. Manual n8n retries or state resets can duplicate mail.
+SMTP may already have accepted the message. Phase 8B1 quarantines stale claims
+as `uncertain` after 30 minutes and never resets or replays them automatically.
+SMTP acceptance does not prove inbox delivery, and database/SMTP cannot provide
+an atomic exactly-once transaction. Manual n8n retries or state resets can
+duplicate mail.
 
 There is no inbound reply detection. An operator can suppress a scheduled
 follow-up before it is claimed using a parameterized query:
@@ -1083,6 +1109,105 @@ different-key claims, completed replay, fingerprint conflicts, failed-state
 suppression, the unique constraint, and repeatable migration without sleeps or
 credentials.
 
+## Phase 8B1: Email recovery and uncertain-send reconciliation
+
+Phase 8B1 makes initial-response and follow-up email attempts durable without
+pretending that PostgreSQL and SMTP can provide an exactly-once transaction.
+Before either SMTP node can run, one PostgreSQL statement atomically changes an
+eligible row to `sending` and records claim identity. Only the execution that
+owns that claim may send or record its outcome.
+
+Migration `postgres/init/006_add_email_recovery.sql` is additive,
+transactional, rerunnable, and preserves legacy rows. It adds
+`initial_response_delivery_status`, `initial_response_claim_token`, and
+`initial_response_claimed_at`, and extends the follow-up constraint with
+`uncertain`. Initial delivery status is nullable for legacy/not-attempted rows
+and otherwise permits `sending`, `sent`, `failed`, or `uncertain`. Follow-up
+status permits `scheduled`, `sending`, `sent`, `failed`, `cancelled`,
+`uncertain`, or NULL.
+
+Delivery state meanings:
+
+- `sending`: one execution owns the attempt; acceptance is not yet durably
+  known.
+- `sent`: SMTP explicitly reported acceptance and the owning claim recorded it.
+- `failed`: failure was proved before SMTP, or SMTP explicitly rejected the
+  recipient without accepting it.
+- `uncertain`: delivery may or may not have been accepted. It is quarantined
+  and is never retried automatically.
+- `scheduled`/`cancelled`: follow-up-only states for future eligible work or an
+  operator-suppressed follow-up.
+
+Initial delivery uses only the recipient, subject, and body returned by the
+atomic PostgreSQL claim plus the configured `FLOWPILOT_LEAD_EMAIL_FROM` sender.
+It does not accept message content from the approval POST and does not call AI.
+Confirmed acceptance records `sent`, sets `initial_response_sent_at`, and
+schedules exactly one follow-up for `NOW() + INTERVAL '72 hours'` in the same
+guarded update. Failure and uncertainty do not schedule a follow-up.
+
+The Phase 7 follow-up claim remains the existing atomic
+`FOR UPDATE SKIP LOCKED` transition from due `scheduled` work to `sending`.
+Result updates still require the claimed row and claim timestamp. Confirmed
+acceptance becomes `sent`, an explicit rejection becomes `failed`, and an
+ambiguous outcome becomes `uncertain`. Rows in `sending`, `sent`, `failed`,
+`cancelled`, `uncertain`, or any ineligible lead state cannot be claimed.
+
+The separate `n8n/flowpilot-recovery-workflow.json` runs hourly and performs
+PostgreSQL updates only. Initial-response and follow-up claims that have stayed
+`sending` for at least 30 minutes are changed to `uncertain` with guarded
+conditions. Fresh claims are untouched. The workflow has no SMTP, AI, HTTP, or
+other external integration and therefore cannot send or retry email.
+
+### Configure and verify Phase 8B1
+
+Apply migration `006` to an existing database before activating the updated
+approval, follow-up, or recovery workflows:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/006_add_email_recovery.sql'
+```
+
+Import all four workflow JSON files from `n8n/` into n8n `2.37.10`. Reselect
+the local `FlowPilot PostgreSQL` credential on all PostgreSQL nodes and the
+local `FlowPilot Email` credential on both SMTP workflows. Ensure
+`FLOWPILOT_LEAD_EMAIL_FROM` is available to n8n, then activate the approval,
+follow-up, and recovery workflows. The recovery schedule is hourly in UTC and
+uses a fixed 30-minute stale threshold.
+
+For a read-only investigation, inspect delivery state, claim age, and n8n
+execution history before taking any manual action:
+
+```sql
+SELECT id,
+       initial_response_delivery_status,
+       initial_response_claimed_at,
+       followup_status,
+       followup_claimed_at
+FROM leads
+WHERE initial_response_delivery_status IN ('sending', 'uncertain')
+   OR followup_status IN ('sending', 'uncertain')
+ORDER BY COALESCE(initial_response_claimed_at, followup_claimed_at), id;
+```
+
+Do not manually reset an uncertain row to a sendable state: the mail server may
+already have accepted that message. Phase 8B1 intentionally provides no
+automatic retry, requeue, inbox-delivery proof, or operator resolution action.
+Those controlled reconciliation policies belong to Phase 8B2.
+
+The optional PostgreSQL tests execute migrations `001` through `006` and the
+exact workflow SQL against one disposable PostgreSQL 17 container. Run all
+reliability integration tests together:
+
+```powershell
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8b1-test'
+python -m pytest tests/integration/test_followup_postgres.py tests/integration/test_idempotency_postgres.py tests/integration/test_email_recovery_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+```
+
+These tests cover migration reruns and constraints, concurrent initial-email
+ownership, the 72-hour scheduling boundary, guarded terminal updates, stale and
+fresh recovery boundaries, and the rule that uncertain work cannot be claimed.
+
 ## Run tests
 
 ```powershell
@@ -1102,9 +1227,10 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 6 (complete):** Human approval workflow
 - **Phase 7 (complete):** One automated follow-up after 72 hours
 - **Phase 8A (complete):** Inbound idempotency and duplicate-request protection
-- **Phase 8B (pending):** Recovery and reconciliation for partial or stuck work
+- **Phase 8B1 (complete):** Email recovery and uncertain-send reconciliation
+- **Phase 8B2 (pending):** Controlled operator reconciliation policies
 - **Phase 8C (pending):** Reliability observability and operational controls
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 8A until it has been reviewed and approved.
+Development stops at Phase 8B1 until it has been reviewed and approved.

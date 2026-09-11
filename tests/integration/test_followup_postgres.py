@@ -68,7 +68,7 @@ def test_migration_rerun_and_constraint(db):
     assert result.returncode != 0 and "leads_followup_status_check" in result.stderr
 
 
-@pytest.mark.parametrize("state", ["sent", "failed", "sending", "cancelled", None])
+@pytest.mark.parametrize("state", ["sent", "failed", "sending", "cancelled", "uncertain", None])
 def test_non_scheduled_states_are_not_claimed(db, state):
     seed(db)
     value = "NULL" if state is None else f"'{state}'"
@@ -102,28 +102,31 @@ def test_exact_72_hours_and_71h59m_without_waiting(db):
 
 def test_schedule_is_atomic_72_hours_and_single_use(db):
     seed(db, 2)
-    sql(db, "UPDATE leads SET initial_response_sent_at=NULL,followup_status=NULL,followup_due_at=NULL;")
-    sql(db, "PREPARE schedule(bigint) AS " + SCHEDULE + " EXECUTE schedule(1);")
+    token = "00000000-0000-4000-8000-000000000001"
+    sql(db, f"UPDATE leads SET initial_response_sent_at=NULL,initial_response_delivery_status='sending',initial_response_claim_token='{token}',followup_status=NULL,followup_due_at=NULL;")
+    sql(db, "PREPARE schedule(bigint,uuid) AS " + SCHEDULE + f" EXECUTE schedule(1,'{token}');")
     assert sql(db, "SELECT followup_status,EXTRACT(EPOCH FROM (followup_due_at-initial_response_sent_at)) FROM leads WHERE id=1;").stdout.strip() == "scheduled|259200.000000"
     before = sql(db, "SELECT row_to_json(leads) FROM leads WHERE id=1;").stdout
-    sql(db, "PREPARE schedule(bigint) AS " + SCHEDULE + " EXECUTE schedule(1);")
+    sql(db, "PREPARE schedule(bigint,uuid) AS " + SCHEDULE + f" EXECUTE schedule(1,'{token}');")
     assert sql(db, "SELECT row_to_json(leads) FROM leads WHERE id=1;").stdout == before
     # Simulated initial SMTP failure: no timestamp query executed for row 2.
     assert sql(db, "SELECT initial_response_sent_at IS NULL AND followup_status IS NULL FROM leads WHERE id=2;").stdout.strip() == "t"
 
 
-@pytest.mark.parametrize("change", ["draft_status='pending_approval'", "draft_status='rejected'", "email='bad'"])
+@pytest.mark.parametrize("change", ["draft_status='pending_approval'", "draft_status='rejected'"])
 def test_timestamp_query_cannot_schedule_ineligible_leads(db, change):
     seed(db)
-    sql(db, f"UPDATE leads SET initial_response_sent_at=NULL,followup_status=NULL,followup_due_at=NULL,{change};")
-    sql(db, "PREPARE schedule(bigint) AS " + SCHEDULE + " EXECUTE schedule(1);")
+    token = "00000000-0000-4000-8000-000000000001"
+    sql(db, f"UPDATE leads SET initial_response_sent_at=NULL,initial_response_delivery_status='sending',initial_response_claim_token='{token}',followup_status=NULL,followup_due_at=NULL,{change};")
+    sql(db, "PREPARE schedule(bigint,uuid) AS " + SCHEDULE + f" EXECUTE schedule(1,'{token}');")
     assert sql(db, "SELECT followup_status IS NULL FROM leads;").stdout.strip() == "t"
 
 
 def test_operator_cancellation_is_preserved_during_scheduling(db):
     seed(db)
-    sql(db, "UPDATE leads SET initial_response_sent_at=NULL,followup_status='cancelled';")
-    sql(db, "PREPARE schedule(bigint) AS " + SCHEDULE + " EXECUTE schedule(1);")
+    token = "00000000-0000-4000-8000-000000000001"
+    sql(db, f"UPDATE leads SET initial_response_sent_at=NULL,initial_response_delivery_status='sending',initial_response_claim_token='{token}',followup_status='cancelled';")
+    sql(db, "PREPARE schedule(bigint,uuid) AS " + SCHEDULE + f" EXECUTE schedule(1,'{token}');")
     assert sql(db, "SELECT followup_status FROM leads;").stdout.strip() == "cancelled"
     assert claim(db) == []
 
@@ -170,9 +173,9 @@ def test_send_result_updates_only_same_claim_without_retries(db, node, status):
     before = sql(db, "SELECT draft_status,initial_response_sent_at FROM leads;").stdout
     query = NODES[node]["parameters"]["query"]
     result = sql(db, "PREPARE mark(bigint,timestamptz) AS " + query + " EXECUTE mark(1,'2000-01-01');")
-    assert result.stdout.strip() == "f"
+    assert result.stdout.strip().split("|")[0] == "f"
     result = sql(db, "PREPARE mark(bigint,timestamptz) AS " + query + f" EXECUTE mark(1,'{row['claim_time']}');")
-    assert result.stdout.strip() == "t"
+    assert result.stdout.strip().split("|")[0] == "t"
     assert sql(db, "SELECT followup_status FROM leads;").stdout.strip() == status
     assert sql(db, "SELECT followup_sent_at IS NULL FROM leads;").stdout.strip() == ("f" if status == "sent" else "t")
     assert sql(db, "SELECT draft_status,initial_response_sent_at FROM leads;").stdout == before

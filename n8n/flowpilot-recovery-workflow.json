@@ -1,0 +1,72 @@
+{
+  "name": "FlowPilot - Email Recovery",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1,
+              "triggerAtMinute": 15
+            }
+          ]
+        }
+      },
+      "id": "phase8b1-recovery-schedule",
+      "name": "Hourly Recovery Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -300,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH stale_initial AS (\n  UPDATE leads\n  SET initial_response_delivery_status = 'uncertain'\n  WHERE initial_response_delivery_status = 'sending'\n    AND initial_response_claim_token IS NOT NULL\n    AND initial_response_claimed_at IS NOT NULL\n    AND initial_response_claimed_at <= NOW() - INTERVAL '30 minutes'\n  RETURNING id\n), stale_followups AS (\n  UPDATE leads\n  SET followup_status = 'uncertain'\n  WHERE followup_status = 'sending'\n    AND followup_claimed_at IS NOT NULL\n    AND followup_claimed_at <= NOW() - INTERVAL '30 minutes'\n  RETURNING id\n)\nSELECT\n  (SELECT COUNT(*) FROM stale_initial) AS initial_quarantined,\n  (SELECT COUNT(*) FROM stale_followups) AS followups_quarantined;",
+        "options": {
+          "queryBatching": "independently"
+        }
+      },
+      "id": "phase8b1-recovery-quarantine",
+      "name": "Quarantine Stale Email Sends",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -40,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Hourly Recovery Schedule": {
+      "main": [
+        [
+          {
+            "node": "Quarantine Stale Email Sends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "active": false,
+  "id": "flowpilotPhase8B1Recovery",
+  "tags": []
+}

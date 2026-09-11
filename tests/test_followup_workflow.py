@@ -70,13 +70,16 @@ def test_migration_is_additive_transactional_and_constrains_states():
 def test_scheduling_is_the_same_update_after_initial_smtp_success():
     query = APPROVAL_NODES["Record Response Sent Timestamp"]["parameters"]["query"]
     assert query.count("UPDATE leads") == 1
-    assert "SET initial_response_sent_at = NOW()" in query
+    assert "initial_response_sent_at = NOW()" in query
+    assert "initial_response_delivery_status = 'sent'" in query
+    assert "initial_response_delivery_status = 'sending'" in query
+    assert "initial_response_claim_token = $2::uuid" in query
     assert "NOW() + INTERVAL '72 hours'" in query
     assert "followup_status IS NULL THEN 'scheduled' ELSE followup_status" in query
     assert "initial_response_sent_at IS NULL" in query
     assert "draft_status = 'approved'" in query
-    assert "AND email ~" in query
-    assert first_target(APPROVAL, "Record Only Sent Email", 0) == "Record Response Sent Timestamp"
+    assert "email" not in query.lower()
+    assert first_target(APPROVAL, "Route Initial SMTP Result", 0) == "Record Response Sent Timestamp"
     assert "Record Response Sent Timestamp" not in reachable(APPROVAL, "Respond Email Failure")
     assert "Record Response Sent Timestamp" not in reachable(APPROVAL, "Approval Review Webhook")
     for node in APPROVAL["nodes"]:
@@ -102,7 +105,7 @@ def test_hourly_schedule_and_atomic_bounded_claim():
     assert "followup_due_at >= initial_response_sent_at + INTERVAL '72 hours'" in CLAIM
 
 
-@pytest.mark.parametrize("status", ["sent", "failed", "sending", "cancelled"])
+@pytest.mark.parametrize("status", ["sent", "failed", "sending", "cancelled", "uncertain"])
 def test_claim_accepts_only_scheduled_status(status):
     eligibility = CLAIM.split("ORDER BY")[0]
     assert "followup_status = 'scheduled'" in eligibility
@@ -169,14 +172,34 @@ def test_multiple_items_keep_their_own_claim_and_recipient():
     {"accepted": []}, {"accepted": ["other@example.com"]},
     {"accepted": ["lead@example.com"], "rejected": ["lead@example.com"]},
 ])
-def test_smtp_failure_or_missing_acceptance_marks_failed_without_raw_details(response):
+def test_ambiguous_smtp_result_marks_uncertain_without_raw_details(response):
     prepared = run_code("Prepare Follow-up Email", claimed())
     result = run_code("Sanitize Follow-up SMTP Result", response, prepared)
-    assert result == {"leadId": "1", "claimTime": prepared["claimTime"], "outcome": "failed"}
+    assert result == {"leadId": "1", "claimTime": prepared["claimTime"], "outcome": "uncertain"}
+
+
+def test_explicit_recipient_rejection_is_failed_and_acceptance_is_sent():
+    prepared = run_code("Prepare Follow-up Email", claimed())
+    rejected = run_code(
+        "Sanitize Follow-up SMTP Result",
+        {"accepted": [], "rejected": ["lead@example.com"]},
+        prepared,
+    )
+    accepted = run_code(
+        "Sanitize Follow-up SMTP Result",
+        {"accepted": ["lead@example.com"], "rejected": []},
+        prepared,
+    )
+    assert rejected["outcome"] == "failed"
+    assert accepted["outcome"] == "sent"
 
 
 def test_updates_require_same_claim_and_cannot_reschedule_or_alter_initial_state():
-    for name, status in (("Mark Follow-up Sent", "sent"), ("Mark Follow-up Failed", "failed")):
+    for name, status in (
+        ("Mark Follow-up Sent", "sent"),
+        ("Mark Follow-up Failed", "failed"),
+        ("Mark Follow-up Uncertain", "uncertain"),
+    ):
         node = NODES[name]
         query = node["parameters"]["query"]
         assert f"followup_status = '{status}'" in query
@@ -187,8 +210,9 @@ def test_updates_require_same_claim_and_cannot_reschedule_or_alter_initial_state
         assert "scheduled" not in query
     assert "followup_sent_at = NOW()" in NODES["Mark Follow-up Sent"]["parameters"]["query"]
     assert "followup_sent_at" not in NODES["Mark Follow-up Failed"]["parameters"]["query"]
-    assert first_target(WORKFLOW, "Record Only Successful Follow-up", 0) == "Mark Follow-up Sent"
-    assert first_target(WORKFLOW, "Record Only Successful Follow-up", 1) == "Mark Follow-up Failed"
+    assert first_target(WORKFLOW, "Route Follow-up SMTP Result", 0) == "Mark Follow-up Sent"
+    assert first_target(WORKFLOW, "Route Follow-up SMTP Result", 1) == "Mark Follow-up Failed"
+    assert first_target(WORKFLOW, "Route Follow-up SMTP Result", 2) == "Mark Follow-up Uncertain"
     assert "Send Follow-up Email" not in reachable(WORKFLOW, "Mark Follow-up Failed")
 
 
@@ -199,7 +223,11 @@ def test_claim_and_state_errors_are_sanitized():
         result = run_code("Sanitize Follow-up State Result", response)
         assert result["error"]["code"] == "FOLLOWUP_STATE_ERROR"
         assert "password" not in json.dumps(result)
-    assert run_code("Sanitize Follow-up State Result", {"recorded": True}) == {"outcome": "recorded"}
+    for state in ("sent", "failed", "uncertain"):
+        assert run_code(
+            "Sanitize Follow-up State Result",
+            {"recorded": True, "delivery_status": state},
+        ) == {"outcome": state}
 
 
 def test_exports_have_no_ai_webhooks_retries_or_credential_payloads():

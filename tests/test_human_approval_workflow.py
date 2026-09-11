@@ -345,8 +345,11 @@ def test_post_approve_reaches_email_only_after_atomic_authorization() -> None:
         assert path.index("Route Approval Result") < path.index(
             "Send Persisted Draft to Lead"
         )
+        assert path.index("Atomically Claim Initial Response") < path.index(
+            "Send Persisted Draft to Lead"
+        )
     assert first_target(workflow, "Route Approval Result", 0) == (
-        "Prepare Approved Email"
+        "Atomically Claim Initial Response"
     )
 
 
@@ -442,9 +445,12 @@ def test_approve_requires_stored_recipient_and_draft_but_reject_does_not() -> No
 def test_approved_email_uses_only_values_returned_by_postgres() -> None:
     workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
     nodes = nodes_by_name(workflow)
-    sanitizer = nodes["Sanitize Authorization Result"]["parameters"]["jsCode"]
+    claim = nodes["Atomically Claim Initial Response"]
+    sanitizer = nodes["Sanitize Initial Send Claim"]["parameters"]["jsCode"]
     email = nodes["Send Persisted Draft to Lead"]
 
+    for field in ("lead.email", "lead.draft_subject", "lead.draft_body"):
+        assert field in claim["parameters"]["query"]
     assert "recipient: row.email" in sanitizer
     assert "subject: row.draft_subject" in sanitizer
     assert "body: row.draft_body" in sanitizer
@@ -477,7 +483,7 @@ def test_reject_and_invalid_paths_can_never_reach_the_email_node() -> None:
     assert email_node not in reachable(workflow, "Respond Rejected")
     assert email_node not in reachable(workflow, "Respond Invalid Approval")
     assert first_target(workflow, "Route Approval Result", 0) == (
-        "Prepare Approved Email"
+        "Atomically Claim Initial Response"
     )
 
 
@@ -493,29 +499,33 @@ def test_sender_is_validated_before_the_email_node() -> None:
         "Send Only Configured Lead Email"
     )
     assert first_target(workflow, "Send Only Configured Lead Email", 1) == (
-        "Respond Email Failure"
+        "Mark Initial Response Failed"
     )
 
 
-def test_smtp_failure_stays_approved_and_does_not_record_sent_timestamp() -> None:
+def test_smtp_failure_stays_approved_and_uses_guarded_delivery_states() -> None:
     workflow = load_workflow(APPROVAL_WORKFLOW_PATH)
     nodes = nodes_by_name(workflow)
 
     assert nodes["Send Persisted Draft to Lead"]["onError"] == (
         "continueRegularOutput"
     )
-    assert first_target(workflow, "Record Only Sent Email", 0) == (
+    assert first_target(workflow, "Route Initial SMTP Result", 0) == (
         "Record Response Sent Timestamp"
     )
-    assert first_target(workflow, "Record Only Sent Email", 1) == (
-        "Respond Email Failure"
+    assert first_target(workflow, "Route Initial SMTP Result", 1) == (
+        "Mark Initial Response Failed"
+    )
+    assert first_target(workflow, "Route Initial SMTP Result", 2) == (
+        "Mark Initial Response Uncertain"
     )
     all_queries = "\n".join(
         node["parameters"].get("query", "") for node in workflow["nodes"]
     )
-    assert "SET initial_response_sent_at = NOW()" in all_queries
+    assert "initial_response_sent_at = NOW()" in all_queries
     assert "SET draft_status = 'pending_approval'" not in all_queries
     assert "initial_response_sent_at IS NULL" in all_queries
+    assert "initial_response_delivery_status = 'uncertain'" in all_queries
 
 
 def test_browser_responses_are_static_sanitized_and_truthful() -> None:
@@ -525,6 +535,7 @@ def test_browser_responses_are_static_sanitized_and_truthful() -> None:
         "Respond Rejected": "FlowPilot — Draft rejected. No email was sent.",
         "Respond Approval Error": "FlowPilot — This approval request could not be completed.",
         "Respond Email Failure": "FlowPilot — Draft approved, but the response email could not be sent.",
+        "Respond Email Uncertain": "FlowPilot — Draft approved, but delivery confirmation is unavailable. No automatic resend will occur.",
     }
     for name, body in expected.items():
         response = nodes[name]["parameters"]
@@ -540,7 +551,10 @@ def test_credential_exports_contain_references_but_no_secrets() -> None:
 
     for node_name, credential_type, expected_name in (
         ("Atomically Authorize Decision", "postgres", "FlowPilot PostgreSQL"),
+        ("Atomically Claim Initial Response", "postgres", "FlowPilot PostgreSQL"),
         ("Record Response Sent Timestamp", "postgres", "FlowPilot PostgreSQL"),
+        ("Mark Initial Response Failed", "postgres", "FlowPilot PostgreSQL"),
+        ("Mark Initial Response Uncertain", "postgres", "FlowPilot PostgreSQL"),
         ("Send Persisted Draft to Lead", "smtp", "FlowPilot Email"),
     ):
         reference = nodes[node_name]["credentials"][credential_type]
