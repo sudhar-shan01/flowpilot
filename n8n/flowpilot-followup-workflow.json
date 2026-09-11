@@ -135,7 +135,7 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const prepared = $('Prepare Follow-up Email').item.json;\nconst result = $json;\nconst accepted = Array.isArray(result.accepted) && result.accepted.some(address => typeof address === 'string' && address.toLowerCase() === prepared.email.recipient.toLowerCase());\nconst sent = !result.error && result.success !== false && accepted && (!Array.isArray(result.rejected) || result.rejected.length === 0);\nreturn { json: { leadId: prepared.leadId, claimTime: prepared.claimTime, outcome: sent ? 'sent' : 'failed' } };"
+        "jsCode": "const prepared = $('Prepare Follow-up Email').item.json;\nconst result = $json && typeof $json === 'object' ? $json : {};\nconst recipient = prepared.email.recipient.toLowerCase();\nconst accepted = Array.isArray(result.accepted) && result.accepted.some((address) => typeof address === 'string' && address.toLowerCase() === recipient);\nconst rejected = Array.isArray(result.rejected) && result.rejected.some((address) => typeof address === 'string' && address.toLowerCase() === recipient);\nlet outcome = 'uncertain';\nif (!result.error && result.success !== false && accepted && !rejected) outcome = 'sent';\nelse if (!accepted && rejected) outcome = 'failed';\nreturn { json: { leadId: prepared.leadId, claimTime: prepared.claimTime, outcome } };"
       },
       "id": "phase7-node-6",
       "name": "Sanitize Follow-up SMTP Result",
@@ -160,7 +160,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "phase7-rule-6",
+                    "id": "phase8b1-rule-followup-sent",
                     "leftValue": "={{ $json.outcome === 'sent' }}",
                     "rightValue": true,
                     "operator": {
@@ -173,7 +173,57 @@
                 "combinator": "and"
               },
               "renameOutput": true,
-              "outputKey": "yes"
+              "outputKey": "sent"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "phase8b1-rule-followup-failed",
+                    "leftValue": "={{ $json.outcome === 'failed' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "failed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "phase8b1-rule-followup-uncertain",
+                    "leftValue": "={{ $json.outcome === 'uncertain' }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "uncertain"
             }
           ]
         },
@@ -182,7 +232,7 @@
         }
       },
       "id": "phase7-node-7",
-      "name": "Record Only Successful Follow-up",
+      "name": "Route Follow-up SMTP Result",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
@@ -194,7 +244,7 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'sent', followup_sent_at = NOW()\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING id\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded;",
+        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'sent', followup_sent_at = NOW()\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING followup_status\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded,\n       (SELECT followup_status FROM recorded) AS delivery_status;",
         "options": {
           "queryBatching": "independently",
           "queryReplacement": "={{ [$json.leadId, $json.claimTime] }}"
@@ -220,7 +270,7 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'failed'\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING id\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded;",
+        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'failed'\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING followup_status\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded,\n       (SELECT followup_status FROM recorded) AS delivery_status;",
         "options": {
           "queryBatching": "independently",
           "queryReplacement": "={{ [$json.leadId, $json.claimTime] }}"
@@ -289,7 +339,7 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const row = $json;\nif (row.error || !(row.recorded === true || row.recorded === 'true')) {\n  return { json: { outcome: 'error', error: { code: 'FOLLOWUP_STATE_ERROR', message: 'The follow-up result could not be recorded.' } } };\n}\nreturn { json: { outcome: 'recorded' } };"
+        "jsCode": "const row = $json && typeof $json === 'object' ? $json : {};\nconst recorded = row.recorded === true || row.recorded === 'true';\nif (row.error || !recorded || !['sent', 'failed', 'uncertain'].includes(row.delivery_status)) {\n  return { json: { outcome: 'error', error: { code: 'FOLLOWUP_STATE_ERROR', message: 'The follow-up result could not be recorded.' } } };\n}\nreturn { json: { outcome: row.delivery_status } };"
       },
       "id": "phase7-node-11",
       "name": "Sanitize Follow-up State Result",
@@ -313,6 +363,32 @@
         300,
         400
       ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH recorded AS (\n  UPDATE leads SET followup_status = 'uncertain'\n  WHERE id = $1::bigint AND followup_status = 'sending'\n    AND followup_claimed_at = $2::timestamptz\n  RETURNING followup_status\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS recorded,\n       (SELECT followup_status FROM recorded) AS delivery_status;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [$json.leadId, $json.claimTime] }}"
+        }
+      },
+      "id": "phase8b1-followup-mark-uncertain",
+      "name": "Mark Follow-up Uncertain",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        780,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
     }
   ],
   "connections": {
@@ -382,25 +458,7 @@
       "main": [
         [
           {
-            "node": "Record Only Successful Follow-up",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Record Only Successful Follow-up": {
-      "main": [
-        [
-          {
-            "node": "Mark Follow-up Sent",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Mark Follow-up Failed",
+            "node": "Route Follow-up SMTP Result",
             "type": "main",
             "index": 0
           }
@@ -437,6 +495,49 @@
       ]
     },
     "Mark Follow-up Failed": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Follow-up State Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Follow-up SMTP Result": {
+      "main": [
+        [
+          {
+            "node": "Mark Follow-up Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Follow-up Failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Follow-up Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitized Claim Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Follow-up Uncertain": {
       "main": [
         [
           {
