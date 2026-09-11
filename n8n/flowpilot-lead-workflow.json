@@ -68,7 +68,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ ($env.FLOWPILOT_API_URL || 'http://host.docker.internal:8000').replace(/\\\/$/, '') + '/lead/analyze' }}",
+        "url": "={{ ($env.FLOWPILOT_API_URL || 'http://host.docker.internal:8000').replace(/\\/$/, '') + '/lead/analyze' }}",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify($json) }}",
@@ -238,7 +238,10 @@
       "name": "Create Approval Token",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.7,
-      "position": [4360, 0],
+      "position": [
+        4360,
+        0
+      ],
       "credentials": {
         "postgres": {
           "id": "e049c98c-4488-4bc5-b999-b9168732df21",
@@ -255,7 +258,10 @@
       "name": "Sanitize Approval Token",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4600, 0]
+      "position": [
+        4600,
+        0
+      ]
     },
     {
       "parameters": {
@@ -1278,7 +1284,7 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "WITH candidate AS (\n  SELECT\n    $1::text AS idempotency_key,\n    encode(sha256(convert_to($2::text, 'UTF8')), 'hex') AS request_fingerprint,\n    gen_random_uuid() AS attempted_claim_token\n), claimed AS (\n  INSERT INTO flowpilot_idempotency (idempotency_key, request_fingerprint, status, claim_token)\n  SELECT idempotency_key, request_fingerprint, 'processing', attempted_claim_token\n  FROM candidate\n  ON CONFLICT (idempotency_key) DO UPDATE\n    SET updated_at = flowpilot_idempotency.updated_at\n  RETURNING\n    flowpilot_idempotency.request_fingerprint,\n    flowpilot_idempotency.status,\n    flowpilot_idempotency.claim_token,\n    flowpilot_idempotency.response_payload,\n    flowpilot_idempotency.claim_token = (SELECT attempted_claim_token FROM candidate) AS is_owner\n)\nSELECT\n  CASE\n    WHEN claimed.request_fingerprint <> candidate.request_fingerprint THEN 'conflict'\n    WHEN claimed.is_owner THEN 'owner'\n    WHEN claimed.status = 'completed' THEN 'completed'\n    WHEN claimed.status = 'processing' THEN 'in_progress'\n    ELSE 'failed'\n  END AS outcome,\n  claimed.request_fingerprint,\n  claimed.claim_token::text AS claim_token,\n  CASE WHEN claimed.status = 'completed' THEN claimed.response_payload ELSE NULL END AS response_payload\nFROM claimed\nCROSS JOIN candidate;",
+        "query": "WITH candidate AS (\n  SELECT\n    $1::text AS idempotency_key,\n    encode(sha256(convert_to($2::text, 'UTF8')), 'hex') AS request_fingerprint,\n    gen_random_uuid() AS attempted_claim_token\n), claimed AS (\n  INSERT INTO flowpilot_idempotency (\n    idempotency_key,\n    request_fingerprint,\n    status,\n    claim_token,\n    workflow_stage,\n    stage_updated_at\n  )\n  SELECT\n    idempotency_key,\n    request_fingerprint,\n    'processing',\n    attempted_claim_token,\n    'claimed',\n    NOW()\n  FROM candidate\n  ON CONFLICT (idempotency_key) DO UPDATE\n    SET updated_at = flowpilot_idempotency.updated_at\n  RETURNING\n    flowpilot_idempotency.request_fingerprint,\n    flowpilot_idempotency.status,\n    flowpilot_idempotency.claim_token,\n    flowpilot_idempotency.response_payload,\n    flowpilot_idempotency.claim_token = (SELECT attempted_claim_token FROM candidate) AS is_owner\n)\nSELECT\n  CASE\n    WHEN claimed.request_fingerprint <> candidate.request_fingerprint THEN 'conflict'\n    WHEN claimed.is_owner THEN 'owner'\n    WHEN claimed.status = 'completed' THEN 'completed'\n    WHEN claimed.status = 'processing' THEN 'in_progress'\n    WHEN claimed.status = 'recovery_required' THEN 'recovery_required'\n    ELSE 'failed'\n  END AS outcome,\n  claimed.request_fingerprint,\n  claimed.claim_token::text AS claim_token,\n  CASE WHEN claimed.status = 'completed' THEN claimed.response_payload ELSE NULL END AS response_payload\nFROM claimed\nCROSS JOIN candidate;",
         "options": {
           "queryReplacement": "={{ [$json.idempotency_key, $json.canonical_payload] }}"
         }
@@ -1301,7 +1307,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const row = $json && typeof $json === 'object' ? $json : {};\nconst failure = (code, message, statusCode = 409) => [{ json: { idempotency_action: 'error', statusCode, error: { code, message } } }];\n\nif (row.error) return failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);\nif (row.outcome === 'owner' && typeof row.claim_token === 'string' && typeof row.request_fingerprint === 'string') {\n  return [{ json: { idempotency_action: 'process', claim_token: row.claim_token, request_fingerprint: row.request_fingerprint } }];\n}\nif (row.outcome === 'in_progress') return failure('REQUEST_IN_PROGRESS', 'A request with this Idempotency-Key is already processing.');\nif (row.outcome === 'conflict') return failure('IDEMPOTENCY_CONFLICT', 'This Idempotency-Key was already used with a different request.');\nif (row.outcome === 'failed') return failure('REQUEST_FAILED', 'The original request did not complete and cannot be retried automatically.');\n\nif (row.outcome === 'completed') {\n  let payload = row.response_payload;\n  if (typeof payload === 'string') {\n    try { payload = JSON.parse(payload); } catch { return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503); }\n  }\n  const priorities = new Set(['high', 'medium', 'low']);\n  const analysis = payload && payload.analysis;\n  const valid = payload && payload.success === true && priorities.has(payload.route) && typeof payload.message === 'string' && analysis && typeof analysis === 'object' && typeof analysis.category === 'string' && priorities.has(analysis.priority) && Number.isInteger(analysis.lead_score) && analysis.lead_score >= 0 && analysis.lead_score <= 100 && typeof analysis.short_summary === 'string' && typeof analysis.recommended_action === 'string';\n  if (!valid) return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503);\n  return [{ json: { idempotency_action: 'replay', public_response: { success: true, route: payload.route, message: payload.message, analysis: { category: analysis.category, priority: analysis.priority, lead_score: analysis.lead_score, short_summary: analysis.short_summary, recommended_action: analysis.recommended_action } } } }];\n}\n\nreturn failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);"
+        "jsCode": "const row = $json && typeof $json === 'object' ? $json : {};\nconst failure = (code, message, statusCode = 409) => [{ json: { idempotency_action: 'error', statusCode, error: { code, message } } }];\n\nif (row.error) return failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);\nif (row.outcome === 'owner' && typeof row.claim_token === 'string' && typeof row.request_fingerprint === 'string') {\n  return [{ json: { idempotency_action: 'process', claim_token: row.claim_token, request_fingerprint: row.request_fingerprint } }];\n}\nif (row.outcome === 'in_progress') return failure('REQUEST_IN_PROGRESS', 'A request with this Idempotency-Key is already processing.');\nif (row.outcome === 'conflict') return failure('IDEMPOTENCY_CONFLICT', 'This Idempotency-Key was already used with a different request.');\nif (row.outcome === 'recovery_required') return failure('RECONCILIATION_REQUIRED', 'The original request requires manual reconciliation and cannot be retried automatically.');\nif (row.outcome === 'failed') return failure('REQUEST_FAILED', 'The original request did not complete and cannot be retried automatically.');\n\nif (row.outcome === 'completed') {\n  let payload = row.response_payload;\n  if (typeof payload === 'string') {\n    try { payload = JSON.parse(payload); } catch { return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503); }\n  }\n  const priorities = new Set(['high', 'medium', 'low']);\n  const analysis = payload && payload.analysis;\n  const valid = payload && payload.success === true && priorities.has(payload.route) && typeof payload.message === 'string' && analysis && typeof analysis === 'object' && typeof analysis.category === 'string' && priorities.has(analysis.priority) && Number.isInteger(analysis.lead_score) && analysis.lead_score >= 0 && analysis.lead_score <= 100 && typeof analysis.short_summary === 'string' && typeof analysis.recommended_action === 'string';\n  if (!valid) return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503);\n  return [{ json: { idempotency_action: 'replay', public_response: { success: true, route: payload.route, message: payload.message, analysis: { category: analysis.category, priority: analysis.priority, lead_score: analysis.lead_score, short_summary: analysis.short_summary, recommended_action: analysis.recommended_action } } } }];\n}\n\nreturn failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);"
       },
       "id": "f1000004-0000-4000-8000-000000000001",
       "name": "Sanitize Idempotency Claim",
@@ -1473,9 +1479,10 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "UPDATE flowpilot_idempotency\nSET status = 'completed',\n    response_payload = $4::jsonb,\n    completed_at = NOW(),\n    updated_at = NOW()\nWHERE idempotency_key = $1\n  AND request_fingerprint = $2\n  AND claim_token = $3::uuid\n  AND status = 'processing'\nRETURNING TRUE AS idempotency_completed;",
+        "query": "WITH finalized AS (\n  UPDATE flowpilot_idempotency\n  SET status = 'completed',\n      completed_at = NOW(),\n      updated_at = NOW()\n  WHERE idempotency_key = $1\n    AND request_fingerprint = $2\n    AND claim_token = $3::uuid\n    AND status = 'processing'\n    AND workflow_stage = 'business_complete'\n    AND (CASE\n    WHEN jsonb_typeof(response_payload) = 'object' THEN\n      (SELECT COUNT(*) FROM jsonb_object_keys(response_payload)) = 4\n      AND response_payload ?& ARRAY['success', 'route', 'message', 'analysis']::text[]\n      AND (response_payload->'success') = 'true'::jsonb\n      AND jsonb_typeof(response_payload->'route') = 'string'\n      AND response_payload->>'route' IN ('high', 'medium', 'low')\n      AND jsonb_typeof(response_payload->'message') = 'string'\n      AND CASE\n        WHEN jsonb_typeof(response_payload->'analysis') = 'object' THEN\n          (SELECT COUNT(*) FROM jsonb_object_keys(response_payload->'analysis')) = 5\n          AND (response_payload->'analysis') ?& ARRAY['category', 'priority', 'lead_score', 'short_summary', 'recommended_action']::text[]\n          AND jsonb_typeof(response_payload->'analysis'->'category') = 'string'\n          AND jsonb_typeof(response_payload->'analysis'->'priority') = 'string'\n          AND response_payload->'analysis'->>'priority' IN ('high', 'medium', 'low')\n          AND response_payload->>'route' = response_payload->'analysis'->>'priority'\n          AND jsonb_typeof(response_payload->'analysis'->'short_summary') = 'string'\n          AND jsonb_typeof(response_payload->'analysis'->'recommended_action') = 'string'\n          AND CASE\n            WHEN jsonb_typeof(response_payload->'analysis'->'lead_score') = 'number'\n              AND response_payload->'analysis'->>'lead_score' ~ '^(0|[1-9][0-9]{0,2})$'\n            THEN (response_payload->'analysis'->>'lead_score')::integer BETWEEN 0 AND 100\n            ELSE FALSE\n          END\n        ELSE FALSE\n      END\n    ELSE FALSE\n  END)\n  RETURNING status\n)\nSELECT EXISTS (SELECT 1 FROM finalized) AS idempotency_completed;",
         "options": {
-          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token, JSON.stringify($json.public_response)] }}"
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token] }}",
+          "queryBatching": "independently"
         }
       },
       "id": "f1000010-0000-4000-8000-000000000001",
@@ -1610,9 +1617,10 @@
       "parameters": {
         "resource": "database",
         "operation": "executeQuery",
-        "query": "UPDATE flowpilot_idempotency\nSET status = 'failed',\n    updated_at = NOW()\nWHERE idempotency_key = $1\n  AND request_fingerprint = $2\n  AND claim_token = $3::uuid\n  AND status = 'processing'\nRETURNING TRUE AS idempotency_failed;",
+        "query": "WITH classified AS (\n  UPDATE flowpilot_idempotency\n  SET status = CASE workflow_stage\n        WHEN 'claimed' THEN 'failed'\n        WHEN 'business_started' THEN 'recovery_required'\n      END,\n      updated_at = NOW()\n  WHERE idempotency_key = $1\n    AND request_fingerprint = $2\n    AND claim_token = $3::uuid\n    AND status = 'processing'\n    AND workflow_stage IN ('claimed', 'business_started')\n  RETURNING status\n)\nSELECT\n  EXISTS (SELECT 1 FROM classified) AS idempotency_classified,\n  (SELECT status FROM classified) AS idempotency_status;",
         "options": {
-          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token] }}"
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token] }}",
+          "queryBatching": "independently"
         }
       },
       "id": "f1000015-0000-4000-8000-000000000001",
@@ -1642,6 +1650,237 @@
       "position": [
         7000,
         400
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f2000001-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $('Prepare Idempotency Context').item.json.idempotency_mode }}",
+                    "rightValue": "valid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "keyed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f2000001-0000-4000-8000-000000000002",
+                    "leftValue": "={{ $('Prepare Idempotency Context').item.json.idempotency_mode }}",
+                    "rightValue": "absent",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "unkeyed"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f2000001-0000-4000-8000-000000000003",
+      "name": "Start Business Only If Keyed",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        280,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH advanced AS (\n  UPDATE flowpilot_idempotency\n  SET workflow_stage = 'business_started',\n      stage_updated_at = NOW(),\n      updated_at = NOW()\n  WHERE idempotency_key = $1\n    AND request_fingerprint = $2\n    AND claim_token = $3::uuid\n    AND status = 'processing'\n    AND workflow_stage = 'claimed'\n  RETURNING workflow_stage\n)\nSELECT EXISTS (SELECT 1 FROM advanced) AS business_started;",
+        "options": {
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token] }}",
+          "queryBatching": "independently"
+        }
+      },
+      "id": "f2000002-0000-4000-8000-000000000001",
+      "name": "Mark Idempotency Business Started",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        520,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json && typeof $json === 'object' ? $json : {};\nif (result.error || result.business_started !== true) {\n  return [{ json: { business_stage_action: 'error', statusCode: 503, error: { code: 'IDEMPOTENCY_STATE_ERROR', message: 'The request could not safely begin business processing.' } } }];\n}\nconst validated = $('Validate API Result').item.json;\nreturn [{ json: { ...validated, business_stage_action: 'process' } }];"
+      },
+      "id": "f2000003-0000-4000-8000-000000000001",
+      "name": "Sanitize Business Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f2000004-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.business_stage_action }}",
+                    "rightValue": "process",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "process"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f2000004-0000-4000-8000-000000000002",
+      "name": "Route Business Started Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH incoming AS (\n  SELECT $4::jsonb AS response_payload\n), recorded AS (\n  UPDATE flowpilot_idempotency\n  SET workflow_stage = 'business_complete',\n      stage_updated_at = NOW(),\n      response_payload = incoming.response_payload,\n      updated_at = NOW()\n  FROM incoming\n  WHERE idempotency_key = $1\n    AND request_fingerprint = $2\n    AND claim_token = $3::uuid\n    AND status = 'processing'\n    AND workflow_stage = 'business_started'\n    AND (CASE\n    WHEN jsonb_typeof(incoming.response_payload) = 'object' THEN\n      (SELECT COUNT(*) FROM jsonb_object_keys(incoming.response_payload)) = 4\n      AND incoming.response_payload ?& ARRAY['success', 'route', 'message', 'analysis']::text[]\n      AND (incoming.response_payload->'success') = 'true'::jsonb\n      AND jsonb_typeof(incoming.response_payload->'route') = 'string'\n      AND incoming.response_payload->>'route' IN ('high', 'medium', 'low')\n      AND jsonb_typeof(incoming.response_payload->'message') = 'string'\n      AND CASE\n        WHEN jsonb_typeof(incoming.response_payload->'analysis') = 'object' THEN\n          (SELECT COUNT(*) FROM jsonb_object_keys(incoming.response_payload->'analysis')) = 5\n          AND (incoming.response_payload->'analysis') ?& ARRAY['category', 'priority', 'lead_score', 'short_summary', 'recommended_action']::text[]\n          AND jsonb_typeof(incoming.response_payload->'analysis'->'category') = 'string'\n          AND jsonb_typeof(incoming.response_payload->'analysis'->'priority') = 'string'\n          AND incoming.response_payload->'analysis'->>'priority' IN ('high', 'medium', 'low')\n          AND incoming.response_payload->>'route' = incoming.response_payload->'analysis'->>'priority'\n          AND jsonb_typeof(incoming.response_payload->'analysis'->'short_summary') = 'string'\n          AND jsonb_typeof(incoming.response_payload->'analysis'->'recommended_action') = 'string'\n          AND CASE\n            WHEN jsonb_typeof(incoming.response_payload->'analysis'->'lead_score') = 'number'\n              AND incoming.response_payload->'analysis'->>'lead_score' ~ '^(0|[1-9][0-9]{0,2})$'\n            THEN (incoming.response_payload->'analysis'->>'lead_score')::integer BETWEEN 0 AND 100\n            ELSE FALSE\n          END\n        ELSE FALSE\n      END\n    ELSE FALSE\n  END)\n  RETURNING workflow_stage\n)\nSELECT EXISTS (SELECT 1 FROM recorded) AS business_complete;",
+        "options": {
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token, JSON.stringify($json.public_response)] }}",
+          "queryBatching": "independently"
+        }
+      },
+      "id": "f2000005-0000-4000-8000-000000000001",
+      "name": "Record Idempotency Business Complete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        7240,
+        -360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json && typeof $json === 'object' ? $json : {};\nif (result.error || result.business_complete !== true) {\n  return [{ json: { business_complete_action: 'error', statusCode: 503, error: { code: 'IDEMPOTENCY_STATE_ERROR', message: 'The completed request could not be stored safely for replay.' } } }];\n}\nconst prepared = $('Prepare Idempotency Completion').item.json.public_response;\nreturn [{ json: { business_complete_action: 'finalize', public_response: prepared } }];"
+      },
+      "id": "f2000006-0000-4000-8000-000000000001",
+      "name": "Sanitize Business Complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7480,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f2000007-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.business_complete_action }}",
+                    "rightValue": "finalize",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "finalize"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f2000007-0000-4000-8000-000000000002",
+      "name": "Route Business Complete Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        7720,
+        -360
       ]
     }
   ],
@@ -1695,7 +1934,7 @@
       "main": [
         [
           {
-            "node": "Persist Lead in PostgreSQL",
+            "node": "Start Business Only If Keyed",
             "type": "main",
             "index": 0
           }
@@ -2214,7 +2453,7 @@
       "main": [
         [
           {
-            "node": "Mark Idempotency Completed",
+            "node": "Record Idempotency Business Complete",
             "type": "main",
             "index": 0
           }
@@ -2313,6 +2552,111 @@
         [
           {
             "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Business Only If Keyed": {
+      "main": [
+        [
+          {
+            "node": "Mark Idempotency Business Started",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Persist Lead in PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Idempotency Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Idempotency Business Started": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Business Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Business Started": {
+      "main": [
+        [
+          {
+            "node": "Route Business Started Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Business Started Result": {
+      "main": [
+        [
+          {
+            "node": "Persist Lead in PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Idempotency Business Complete": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Business Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Business Complete": {
+      "main": [
+        [
+          {
+            "node": "Route Business Complete Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Business Complete Result": {
+      "main": [
+        [
+          {
+            "node": "Mark Idempotency Completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Error",
             "type": "main",
             "index": 0
           }

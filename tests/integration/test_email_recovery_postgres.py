@@ -49,7 +49,7 @@ FOLLOWUP_CLAIM = FOLLOWUP_NODES["Atomically Claim Due Follow-ups"]["parameters"]
 FOLLOWUP_UNCERTAIN = FOLLOWUP_NODES["Mark Follow-up Uncertain"]["parameters"][
     "query"
 ].rstrip(";")
-RECOVERY_SWEEP = RECOVERY_NODES["Quarantine Stale Email Sends"]["parameters"][
+RECOVERY_SWEEP = RECOVERY_NODES["Reconcile Stale Work"]["parameters"][
     "query"
 ].rstrip(";")
 
@@ -278,7 +278,7 @@ def test_recovery_quarantines_only_stale_initial_and_followup_sends(db):
         UPDATE leads SET followup_status='failed',followup_claimed_at=NOW()-INTERVAL '31 minutes' WHERE id=9;
         UPDATE leads SET followup_status='cancelled',followup_claimed_at=NOW()-INTERVAL '31 minutes' WHERE id=10;""",
     )
-    assert sql(db, RECOVERY_SWEEP).stdout.strip() == "1|1"
+    assert sql(db, RECOVERY_SWEEP).stdout.strip().split("|")[:2] == ["1", "1"]
     assert sql(
         db,
         "SELECT string_agg(id || ':' || COALESCE(initial_response_delivery_status,'null'),',' ORDER BY id) FROM leads WHERE id<=5;",

@@ -251,7 +251,7 @@ def test_followup_ambiguous_result_routes_to_guarded_uncertain_state():
 
 def test_recovery_workflow_only_quarantines_stale_sending_rows():
     schedule = RECOVERY_NODES["Hourly Recovery Schedule"]
-    quarantine = RECOVERY_NODES["Quarantine Stale Email Sends"]
+    quarantine = RECOVERY_NODES["Reconcile Stale Work"]
     query = quarantine["parameters"]["query"]
     assert schedule["parameters"]["rule"]["interval"] == [
         {"field": "hours", "hoursInterval": 1, "triggerAtMinute": 15}
