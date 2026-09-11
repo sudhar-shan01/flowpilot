@@ -99,7 +99,9 @@ def test_only_a_valid_analysis_can_reach_persistence() -> None:
     assert connections[gate["name"]]["main"][0][0]["node"] == (
         "Persist Lead in PostgreSQL"
     )
-    assert connections[gate["name"]]["main"][1][0]["node"] == "Respond Error"
+    assert connections[gate["name"]]["main"][1][0]["node"] == (
+        "Prepare Idempotency Failure"
+    )
 
     validation_code = nodes["Validate API Result"]["parameters"]["jsCode"]
     assert "$('Prepare Lead').item.json" in validation_code

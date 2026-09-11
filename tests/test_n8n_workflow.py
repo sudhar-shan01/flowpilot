@@ -36,7 +36,10 @@ def test_workflow_maps_exact_lead_contract() -> None:
         "message",
         "budget",
     }
-    assert all("$json.body." in assignment["value"] for assignment in assignments)
+    assert all(
+        "$('Prepare Idempotency Context').item.json.body." in assignment["value"]
+        for assignment in assignments
+    )
 
 
 def test_workflow_calls_flowpilot_through_configurable_url() -> None:
@@ -68,7 +71,7 @@ def test_workflow_has_three_priority_routes_and_clean_error_route() -> None:
         "Prepare High Response",
         "Prepare Medium Response",
         "Prepare Low Response",
-        "Respond Error",
+        "Prepare Idempotency Failure",
     ]
 
     validation_code = nodes["Validate API Result"]["parameters"]["jsCode"]
@@ -88,4 +91,4 @@ def test_workflow_contains_no_secrets_or_sample_customer_data() -> None:
     assert "acme industries" not in workflow_text.lower()
     assert "api_key" not in workflow_text.lower()
     assert set(postgres["credentials"]["postgres"]) == {"id", "name"}
-    assert workflow_text.count("n8n-nodes-base.respondToWebhook") == 2
+    assert workflow_text.count("n8n-nodes-base.respondToWebhook") == 4

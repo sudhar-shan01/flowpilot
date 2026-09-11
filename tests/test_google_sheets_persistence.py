@@ -110,7 +110,7 @@ def test_postgres_failure_bypasses_google_sheets() -> None:
     assert "$json.created_at" in condition["leftValue"]
     assert gate["parameters"]["options"]["fallbackOutput"] == "extra"
     assert first_target(workflow, gate_name, 0) == "Append Lead to Google Sheets"
-    assert first_target(workflow, gate_name, 1) == "Respond Error"
+    assert first_target(workflow, gate_name, 1) == "Prepare Idempotency Failure"
 
 
 def test_google_sheets_failure_is_sanitized() -> None:

@@ -1,5 +1,5 @@
 {
-  "name": "FlowPilot - Lead Intake, Persistence, HubSpot CRM, and Priority Routing",
+  "name": "FlowPilot - Idempotent Lead Intake and Processing",
   "nodes": [
     {
       "parameters": {
@@ -25,31 +25,31 @@
             {
               "id": "15a37c44-7919-44b9-98d8-b4c6ef307341",
               "name": "name",
-              "value": "={{ $json.body.name }}",
+              "value": "={{ $('Prepare Idempotency Context').item.json.body.name }}",
               "type": "string"
             },
             {
               "id": "e62ea44c-176b-4d99-bbe0-f37686b71e33",
               "name": "email",
-              "value": "={{ $json.body.email }}",
+              "value": "={{ $('Prepare Idempotency Context').item.json.body.email }}",
               "type": "string"
             },
             {
               "id": "67024f4c-3a3d-4622-9429-d7ee1c76d891",
               "name": "company",
-              "value": "={{ $json.body.company }}",
+              "value": "={{ $('Prepare Idempotency Context').item.json.body.company }}",
               "type": "string"
             },
             {
               "id": "5d335487-f5f7-4abc-87f6-769c1554549c",
               "name": "message",
-              "value": "={{ $json.body.message }}",
+              "value": "={{ $('Prepare Idempotency Context').item.json.body.message }}",
               "type": "string"
             },
             {
               "id": "376fe7f9-276f-41f6-88d2-4b0573cda1b1",
               "name": "budget",
-              "value": "={{ $json.body.budget }}",
+              "value": "={{ $('Prepare Idempotency Context').item.json.body.budget }}",
               "type": "number"
             }
           ]
@@ -1193,6 +1193,456 @@
         6280,
         340
       ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $json && typeof $json === 'object' ? $json : {};\nconst headers = envelope.headers && typeof envelope.headers === 'object' ? envelope.headers : {};\nconst input = envelope.body && typeof envelope.body === 'object' && !Array.isArray(envelope.body) ? envelope.body : {};\nconst rawKey = headers['idempotency-key'];\n\nconst normalizeText = (value) => typeof value === 'string' ? value.trim() : value;\nconst normalizeBudget = (value) => {\n  if (typeof value === 'number') return value;\n  if (typeof value === 'string' && value.trim() !== '') {\n    const numeric = Number(value);\n    if (Number.isFinite(numeric)) return numeric;\n  }\n  return normalizeText(value);\n};\nconst body = {\n  name: normalizeText(input.name),\n  email: normalizeText(input.email),\n  company: normalizeText(input.company),\n  message: normalizeText(input.message),\n  budget: normalizeBudget(input.budget),\n};\nconst canonicalPayload = JSON.stringify([\n  ['name', body.name ?? null],\n  ['email', body.email ?? null],\n  ['company', body.company ?? null],\n  ['message', body.message ?? null],\n  ['budget', body.budget ?? null],\n]);\n\nif (rawKey === undefined || rawKey === null) {\n  return [{ json: { body, idempotency_mode: 'absent', idempotency_key: null, canonical_payload: canonicalPayload } }];\n}\n\nconst keyPattern = /^[A-Za-z0-9][A-Za-z0-9._~:/+=-]{0,127}$/;\nif (typeof rawKey !== 'string' || !keyPattern.test(rawKey)) {\n  return [{ json: { body, idempotency_mode: 'invalid', idempotency_key: null, canonical_payload: canonicalPayload, statusCode: 400, error: { code: 'INVALID_IDEMPOTENCY_KEY', message: 'Idempotency-Key is invalid.' } } }];\n}\n\nreturn [{ json: { body, idempotency_mode: 'valid', idempotency_key: rawKey, canonical_payload: canonicalPayload } }];"
+      },
+      "id": "f1000001-0000-4000-8000-000000000001",
+      "name": "Prepare Idempotency Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000002-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.idempotency_mode }}",
+                    "rightValue": "valid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "keyed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000002-0000-4000-8000-000000000002",
+                    "leftValue": "={{ $json.idempotency_mode }}",
+                    "rightValue": "absent",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "unkeyed"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f1000002-0000-4000-8000-000000000003",
+      "name": "Route Idempotency Requirement",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -440,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH candidate AS (\n  SELECT\n    $1::text AS idempotency_key,\n    encode(sha256(convert_to($2::text, 'UTF8')), 'hex') AS request_fingerprint,\n    gen_random_uuid() AS attempted_claim_token\n), claimed AS (\n  INSERT INTO flowpilot_idempotency (idempotency_key, request_fingerprint, status, claim_token)\n  SELECT idempotency_key, request_fingerprint, 'processing', attempted_claim_token\n  FROM candidate\n  ON CONFLICT (idempotency_key) DO UPDATE\n    SET updated_at = flowpilot_idempotency.updated_at\n  RETURNING\n    flowpilot_idempotency.request_fingerprint,\n    flowpilot_idempotency.status,\n    flowpilot_idempotency.claim_token,\n    flowpilot_idempotency.response_payload,\n    flowpilot_idempotency.claim_token = (SELECT attempted_claim_token FROM candidate) AS is_owner\n)\nSELECT\n  CASE\n    WHEN claimed.request_fingerprint <> candidate.request_fingerprint THEN 'conflict'\n    WHEN claimed.is_owner THEN 'owner'\n    WHEN claimed.status = 'completed' THEN 'completed'\n    WHEN claimed.status = 'processing' THEN 'in_progress'\n    ELSE 'failed'\n  END AS outcome,\n  claimed.request_fingerprint,\n  claimed.claim_token::text AS claim_token,\n  CASE WHEN claimed.status = 'completed' THEN claimed.response_payload ELSE NULL END AS response_payload\nFROM claimed\nCROSS JOIN candidate;",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotency_key, $json.canonical_payload] }}"
+        }
+      },
+      "id": "f1000003-0000-4000-8000-000000000001",
+      "name": "Atomically Claim Idempotency Key",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -200,
+        -360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $json && typeof $json === 'object' ? $json : {};\nconst failure = (code, message, statusCode = 409) => [{ json: { idempotency_action: 'error', statusCode, error: { code, message } } }];\n\nif (row.error) return failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);\nif (row.outcome === 'owner' && typeof row.claim_token === 'string' && typeof row.request_fingerprint === 'string') {\n  return [{ json: { idempotency_action: 'process', claim_token: row.claim_token, request_fingerprint: row.request_fingerprint } }];\n}\nif (row.outcome === 'in_progress') return failure('REQUEST_IN_PROGRESS', 'A request with this Idempotency-Key is already processing.');\nif (row.outcome === 'conflict') return failure('IDEMPOTENCY_CONFLICT', 'This Idempotency-Key was already used with a different request.');\nif (row.outcome === 'failed') return failure('REQUEST_FAILED', 'The original request did not complete and cannot be retried automatically.');\n\nif (row.outcome === 'completed') {\n  let payload = row.response_payload;\n  if (typeof payload === 'string') {\n    try { payload = JSON.parse(payload); } catch { return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503); }\n  }\n  const priorities = new Set(['high', 'medium', 'low']);\n  const analysis = payload && payload.analysis;\n  const valid = payload && payload.success === true && priorities.has(payload.route) && typeof payload.message === 'string' && analysis && typeof analysis === 'object' && typeof analysis.category === 'string' && priorities.has(analysis.priority) && Number.isInteger(analysis.lead_score) && analysis.lead_score >= 0 && analysis.lead_score <= 100 && typeof analysis.short_summary === 'string' && typeof analysis.recommended_action === 'string';\n  if (!valid) return failure('IDEMPOTENCY_ERROR', 'The saved response could not be replayed safely.', 503);\n  return [{ json: { idempotency_action: 'replay', public_response: { success: true, route: payload.route, message: payload.message, analysis: { category: analysis.category, priority: analysis.priority, lead_score: analysis.lead_score, short_summary: analysis.short_summary, recommended_action: analysis.recommended_action } } } }];\n}\n\nreturn failure('IDEMPOTENCY_ERROR', 'The request could not be safely accepted.', 503);"
+      },
+      "id": "f1000004-0000-4000-8000-000000000001",
+      "name": "Sanitize Idempotency Claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000005-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.idempotency_action }}",
+                    "rightValue": "process",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "process"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000005-0000-4000-8000-000000000002",
+                    "leftValue": "={{ $json.idempotency_action }}",
+                    "rightValue": "replay",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "replay"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f1000005-0000-4000-8000-000000000003",
+      "name": "Route Idempotency Claim",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        280,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.public_response }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "f1000006-0000-4000-8000-000000000001",
+      "name": "Respond Idempotency Replay",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        520,
+        -440
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, error: $json.error } }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}"
+        }
+      },
+      "id": "f1000007-0000-4000-8000-000000000001",
+      "name": "Respond Idempotency Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        520,
+        -280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst context = $('Prepare Idempotency Context').item.json;\nreturn [{ json: { ...data, public_response: { success: true, route: data.route, message: data.message, analysis: data.analysis }, idempotency_required: context.idempotency_mode === 'valid' } }];"
+      },
+      "id": "f1000008-0000-4000-8000-000000000001",
+      "name": "Prepare Idempotency Completion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6760,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000009-0000-4000-8000-000000000001",
+                    "leftValue": "={{ String($json.idempotency_required) }}",
+                    "rightValue": "true",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "keyed"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f1000009-0000-4000-8000-000000000002",
+      "name": "Complete Only Keyed Request",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        7000,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "UPDATE flowpilot_idempotency\nSET status = 'completed',\n    response_payload = $4::jsonb,\n    completed_at = NOW(),\n    updated_at = NOW()\nWHERE idempotency_key = $1\n  AND request_fingerprint = $2\n  AND claim_token = $3::uuid\n  AND status = 'processing'\nRETURNING TRUE AS idempotency_completed;",
+        "options": {
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token, JSON.stringify($json.public_response)] }}"
+        }
+      },
+      "id": "f1000010-0000-4000-8000-000000000001",
+      "name": "Mark Idempotency Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        7240,
+        -200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json;\nif (result.error || result.idempotency_completed !== true) {\n  return [{ json: { completion_action: 'error', statusCode: 503, error: { code: 'IDEMPOTENCY_STATE_ERROR', message: 'The request completed but its replay state could not be recorded.' } } }];\n}\nconst prepared = $('Prepare Idempotency Completion').item.json.public_response;\nreturn [{ json: { completion_action: 'success', route: prepared.route, message: prepared.message, analysis: prepared.analysis } }];"
+      },
+      "id": "f1000011-0000-4000-8000-000000000001",
+      "name": "Sanitize Idempotency Completion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7480,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000012-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.completion_action }}",
+                    "rightValue": "success",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "success"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f1000012-0000-4000-8000-000000000002",
+      "name": "Route Completion Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        7720,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const context = $('Prepare Idempotency Context').item.json;\nconst data = $json;\nconst statusCode = Number.isInteger(data.statusCode) ? data.statusCode : 503;\nconst error = data.error && typeof data.error.code === 'string' && typeof data.error.message === 'string' ? { code: data.error.code, message: data.error.message } : { code: 'WORKFLOW_ERROR', message: 'The request could not be completed.' };\nreturn [{ json: { statusCode, error, idempotency_required: context.idempotency_mode === 'valid' } }];"
+      },
+      "id": "f1000013-0000-4000-8000-000000000001",
+      "name": "Prepare Idempotency Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6280,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f1000014-0000-4000-8000-000000000001",
+                    "leftValue": "={{ String($json.idempotency_required) }}",
+                    "rightValue": "true",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "keyed"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "f1000014-0000-4000-8000-000000000002",
+      "name": "Fail Only Keyed Request",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        6520,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "UPDATE flowpilot_idempotency\nSET status = 'failed',\n    updated_at = NOW()\nWHERE idempotency_key = $1\n  AND request_fingerprint = $2\n  AND claim_token = $3::uuid\n  AND status = 'processing'\nRETURNING TRUE AS idempotency_failed;",
+        "options": {
+          "queryReplacement": "={{ [$('Prepare Idempotency Context').item.json.idempotency_key, $('Sanitize Idempotency Claim').item.json.request_fingerprint, $('Sanitize Idempotency Claim').item.json.claim_token] }}"
+        }
+      },
+      "id": "f1000015-0000-4000-8000-000000000001",
+      "name": "Mark Idempotency Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        6760,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "e049c98c-4488-4bc5-b999-b9168732df21",
+          "name": "FlowPilot PostgreSQL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prepared = $('Prepare Idempotency Failure').item.json;\nreturn [{ json: { statusCode: prepared.statusCode, error: prepared.error } }];"
+      },
+      "id": "f1000016-0000-4000-8000-000000000001",
+      "name": "Restore Sanitized Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7000,
+        400
+      ]
     }
   ],
   "pinData": {},
@@ -1201,7 +1651,7 @@
       "main": [
         [
           {
-            "node": "Prepare Lead",
+            "node": "Prepare Idempotency Context",
             "type": "main",
             "index": 0
           }
@@ -1252,7 +1702,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1292,7 +1742,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1332,7 +1782,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1390,7 +1840,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1463,7 +1913,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1525,7 +1975,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1554,7 +2004,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1594,7 +2044,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1626,7 +2076,7 @@
         ],
         [
           {
-            "node": "Respond Error",
+            "node": "Prepare Idempotency Failure",
             "type": "main",
             "index": 0
           }
@@ -1637,7 +2087,7 @@
       "main": [
         [
           {
-            "node": "Respond Success",
+            "node": "Prepare Idempotency Completion",
             "type": "main",
             "index": 0
           }
@@ -1648,7 +2098,7 @@
       "main": [
         [
           {
-            "node": "Respond Success",
+            "node": "Prepare Idempotency Completion",
             "type": "main",
             "index": 0
           }
@@ -1659,7 +2109,210 @@
       "main": [
         [
           {
+            "node": "Prepare Idempotency Completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Idempotency Context": {
+      "main": [
+        [
+          {
+            "node": "Route Idempotency Requirement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Idempotency Requirement": {
+      "main": [
+        [
+          {
+            "node": "Atomically Claim Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atomically Claim Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Idempotency Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Idempotency Claim": {
+      "main": [
+        [
+          {
+            "node": "Route Idempotency Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Idempotency Claim": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Replay",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Idempotency Completion": {
+      "main": [
+        [
+          {
+            "node": "Complete Only Keyed Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Complete Only Keyed Request": {
+      "main": [
+        [
+          {
+            "node": "Mark Idempotency Completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Idempotency Completed": {
+      "main": [
+        [
+          {
+            "node": "Sanitize Idempotency Completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Idempotency Completion": {
+      "main": [
+        [
+          {
+            "node": "Route Completion Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Completion Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Idempotency Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Idempotency Failure": {
+      "main": [
+        [
+          {
+            "node": "Fail Only Keyed Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fail Only Keyed Request": {
+      "main": [
+        [
+          {
+            "node": "Mark Idempotency Failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Idempotency Failed": {
+      "main": [
+        [
+          {
+            "node": "Restore Sanitized Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Sanitized Failure": {
+      "main": [
+        [
+          {
+            "node": "Respond Error",
             "type": "main",
             "index": 0
           }

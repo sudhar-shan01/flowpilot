@@ -83,9 +83,11 @@ def test_draft_failures_are_sanitized_and_bypass_email() -> None:
     assert "DRAFT_ERROR" in persistence_error
     assert "statusCode: 503" in error_code
     assert "provider" not in error_code.lower()
-    assert first_target(workflow, "Persist Only Valid Draft", 1) == "Respond Error"
+    assert first_target(workflow, "Persist Only Valid Draft", 1) == (
+        "Prepare Idempotency Failure"
+    )
     assert first_target(workflow, "Notify Only After Draft Persistence", 1) == (
-        "Respond Error"
+        "Prepare Idempotency Failure"
     )
 
 
@@ -117,9 +119,11 @@ def test_email_failure_is_sanitized_and_cannot_reach_success_route() -> None:
     assert "statusCode: 503" in code
     assert "credential" not in code.lower()
     assert first_target(workflow, "Send Configured Internal Email", 1) == (
-        "Respond Error"
+        "Prepare Idempotency Failure"
     )
-    assert first_target(workflow, "Route After Email Result", 1) == "Respond Error"
+    assert first_target(workflow, "Route After Email Result", 1) == (
+        "Prepare Idempotency Failure"
+    )
 
 
 def test_email_export_contains_reference_metadata_only_and_no_recipient() -> None:
