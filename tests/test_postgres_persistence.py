@@ -97,6 +97,15 @@ def test_only_a_valid_analysis_can_reach_persistence() -> None:
     ]["conditions"][0]["leftValue"]
     assert connections["Validate API Result"]["main"][0][0]["node"] == gate["name"]
     assert connections[gate["name"]]["main"][0][0]["node"] == (
+        "Start Business Only If Keyed"
+    )
+    assert connections["Start Business Only If Keyed"]["main"][0][0]["node"] == (
+        "Mark Idempotency Business Started"
+    )
+    assert connections["Start Business Only If Keyed"]["main"][1][0]["node"] == (
+        "Persist Lead in PostgreSQL"
+    )
+    assert connections["Route Business Started Result"]["main"][0][0]["node"] == (
         "Persist Lead in PostgreSQL"
     )
     assert connections[gate["name"]]["main"][1][0]["node"] == (

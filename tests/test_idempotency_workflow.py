@@ -170,6 +170,7 @@ def test_missing_key_preserves_backward_compatible_path() -> None:
         ("in_progress", "REQUEST_IN_PROGRESS"),
         ("conflict", "IDEMPOTENCY_CONFLICT"),
         ("failed", "REQUEST_FAILED"),
+        ("recovery_required", "RECONCILIATION_REQUIRED"),
     ],
 )
 def test_duplicate_and_conflict_outcomes_are_sanitized(outcome: str, code: str) -> None:
@@ -244,16 +245,25 @@ def test_only_owner_and_unkeyed_paths_can_enter_business_workflow() -> None:
 
 
 def test_completed_and_failed_updates_require_original_claim() -> None:
+    started = NODES["Mark Idempotency Business Started"]["parameters"]["query"]
+    stored = NODES["Record Idempotency Business Complete"]["parameters"]["query"]
     completed = NODES["Mark Idempotency Completed"]["parameters"]["query"]
     failed = NODES["Mark Idempotency Failed"]["parameters"]["query"]
-    for query in (completed, failed):
+    for query in (started, stored, completed, failed):
         assert "idempotency_key = $1" in query
         assert "request_fingerprint = $2" in query
         assert "claim_token = $3::uuid" in query
         assert "status = 'processing'" in query
-    assert "response_payload = $4::jsonb" in completed
+    assert "workflow_stage = 'claimed'" in started
+    assert "workflow_stage = 'business_started'" in started
+    assert "response_payload = incoming.response_payload" in stored
+    assert "workflow_stage = 'business_complete'" in stored
+    assert "status = 'completed'" not in stored
+    assert "response_payload" not in completed.split("WHERE", 1)[0]
+    assert "workflow_stage = 'business_complete'" in completed
     assert "completed_at = NOW()" in completed
-    assert "status = 'failed'" in failed
+    assert "WHEN 'claimed' THEN 'failed'" in failed
+    assert "WHEN 'business_started' THEN 'recovery_required'" in failed
     assert "response_payload" not in failed
 
 
@@ -307,6 +317,8 @@ def test_no_retry_or_recovery_mechanism_was_added() -> None:
 def test_export_has_reference_metadata_only_and_no_secrets() -> None:
     for name in (
         "Atomically Claim Idempotency Key",
+        "Mark Idempotency Business Started",
+        "Record Idempotency Business Complete",
         "Mark Idempotency Completed",
         "Mark Idempotency Failed",
     ):

@@ -9,7 +9,8 @@ CRM contact synchronization**, and **Phase 5: internal email notifications and
 AI-generated response drafts**, **Phase 6: secure human approval**, and
 **Phase 7: one scheduled follow-up**, **Phase 8A: inbound idempotency and
 duplicate-request protection**, and **Phase 8B1: email recovery and
-uncertain-send reconciliation**.
+uncertain-send reconciliation**, and **Phase 8B2: stale idempotency and
+partial-work reconciliation**.
 
 ## Business problem
 
@@ -28,7 +29,9 @@ Phase 7 schedules one fixed follow-up 72 hours after a successful initial
 response. Phase 8A adds an explicit, atomic idempotency boundary before any
 lead-processing side effect. Phase 8B1 adds durable email delivery claims,
 conservative SMTP outcome classification, and a database-only recovery sweep
-that quarantines stale sends instead of retrying them.
+that quarantines stale sends instead of retrying them. Phase 8B2 records a
+minimal durable workflow stage for keyed requests and reconciles stale work
+without replaying business side effects.
 
 ## Current capabilities
 
@@ -64,6 +67,11 @@ that quarantines stale sends instead of retrying them.
 - Durable `sending`, `sent`, `failed`, and `uncertain` email delivery states
 - Hourly PostgreSQL-only quarantine of delivery claims stale for 30 minutes
 - No automatic replay of uncertain email sends
+- Durable `claimed`, `business_started`, and `business_complete` stages for
+  keyed lead intake
+- Sanitized `RECONCILIATION_REQUIRED` duplicate response for partial work
+- PostgreSQL-only reconciliation of stale idempotency state after 60 minutes
+- Safe completion of stored public responses without rerunning business work
 
 ## Architecture
 
@@ -84,7 +92,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 through 8B1 extend this architecture without changing the public webhook
+Phases 2 through 8B2 extend this architecture without changing the public webhook
 success contract:
 
 ```text
@@ -94,10 +102,14 @@ Webhook caller
 n8n Webhook → validate key + normalize payload
              ├─ no key → existing behavior
              └─ valid key → atomic PostgreSQL claim
-                              ├─ owner → Prepare Lead → POST /lead/analyze
+                              ├─ owner (`claimed`) → Prepare Lead → POST /lead/analyze
                               ├─ completed duplicate → replay public response
-                              └─ processing/conflict/failed → sanitized 409
+                              └─ processing/conflict/failed/recovery-required
+                                                           → sanitized 409
                                                     │ valid only
+                                                    ▼
+                                      atomic `business_started` gate
+                                                    │ owner only
                                                     ▼
                                          PostgreSQL `leads`
                                                     │ saved
@@ -118,6 +130,12 @@ n8n Webhook → validate key + normalize payload
                                                     │ sent
                                                     ▼
                                       Priority switch (high/medium/low)
+                                                    │
+                                                    ▼
+                              store allowlisted response as `business_complete`
+                                                    │
+                                                    ▼
+                                  guarded final transition to `completed`
                                                     │
                                                     ▼
                                           Clean webhook response
@@ -143,6 +161,13 @@ Hourly recovery workflow:
 PostgreSQL Schedule Trigger → stale `sending` claims (30 minutes)
                             → guarded transition to `uncertain`
                             → no SMTP, AI, or external API call
+
+                            → stale idempotency work (60 minutes)
+                              ├─ `claimed` → `failed`
+                              ├─ `business_started` → `recovery_required`
+                              ├─ valid `business_complete` → `completed`
+                              └─ legacy/unsafe state → `recovery_required`
+                            → no business-side-effect replay
 ```
 
 ## Project structure
@@ -173,9 +198,11 @@ flowpilot/
 │   ├── test_followup_workflow.py
 │   ├── test_idempotency_workflow.py
 │   ├── test_email_recovery_workflow.py
+│   ├── test_partial_work_reconciliation_workflow.py
 │   ├── integration/test_followup_postgres.py
 │   ├── integration/test_idempotency_postgres.py
 │   ├── integration/test_email_recovery_postgres.py
+│   ├── integration/test_partial_work_reconciliation_postgres.py
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
@@ -192,7 +219,8 @@ flowpilot/
 │       ├── 003_add_human_approval.sql
 │       ├── 004_add_followups.sql
 │       ├── 005_add_idempotency.sql
-│       └── 006_add_email_recovery.sql
+│       ├── 006_add_email_recovery.sql
+│       └── 007_add_partial_work_reconciliation.sql
 ├── compose.postgres.yml
 ├── .env.example
 ├── .gitignore
@@ -1192,7 +1220,8 @@ ORDER BY COALESCE(initial_response_claimed_at, followup_claimed_at), id;
 Do not manually reset an uncertain row to a sendable state: the mail server may
 already have accepted that message. Phase 8B1 intentionally provides no
 automatic retry, requeue, inbox-delivery proof, or operator resolution action.
-Those controlled reconciliation policies belong to Phase 8B2.
+Phase 8B2 adds separate idempotency-stage reconciliation but deliberately does
+not change or resend these uncertain email states.
 
 The optional PostgreSQL tests execute migrations `001` through `006` and the
 exact workflow SQL against one disposable PostgreSQL 17 container. Run all
@@ -1207,6 +1236,122 @@ Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
 These tests cover migration reruns and constraints, concurrent initial-email
 ownership, the 72-hour scheduling boundary, guarded terminal updates, stale and
 fresh recovery boundaries, and the rule that uncertain work cannot be claimed.
+
+## Phase 8B2: Stale idempotency and partial-work reconciliation
+
+Phase 8B2 prevents a keyed request that stopped mid-work from remaining
+ambiguous forever, while keeping the core safety rule: uncertain business work
+is never replayed automatically. Migration
+`postgres/init/007_add_partial_work_reconciliation.sql` additively extends
+`flowpilot_idempotency` with nullable `workflow_stage` and `stage_updated_at`
+columns, widens the status field for `recovery_required`, and adds explicit
+status, stage, timestamp, and state-consistency constraints. Historical rows
+retain a NULL stage and are not reinterpreted during migration.
+
+New keyed requests use only three durable stages:
+
+- `claimed`: the key and fingerprint have one owner, but no irreversible
+  business side effect has been allowed to start. AI analysis may occur here.
+- `business_started`: the original owner atomically crossed the safety boundary
+  immediately before `Persist Lead in PostgreSQL`. PostgreSQL lead insertion,
+  Sheets, HubSpot, draft/token persistence, and notification email may now have
+  occurred, so replaying the complete workflow is unsafe.
+- `business_complete`: every normal lead-intake side effect succeeded and the
+  exact allowlisted public response is stored, while status deliberately remains
+  `processing` until a separate owner-guarded final update sets `completed`.
+
+The `claimed → business_started` transition requires the idempotency key,
+request fingerprint, original unpredictable claim token, `processing` status,
+and current `claimed` stage in one UPDATE. A keyed request cannot reach the
+first leads INSERT unless that transition succeeds. Unkeyed requests keep their
+existing path. A known failure while still `claimed` becomes `failed`; a known
+failure after `business_started` becomes `recovery_required`.
+
+`recovery_required` means FlowPilot cannot safely infer which durable or
+external side effects happened. A same-payload duplicate receives HTTP 409 with
+`RECONCILIATION_REQUIRED`; a different fingerprint still receives
+`IDEMPOTENCY_CONFLICT`. Neither outcome can reach AI, lead persistence, Sheets,
+HubSpot, draft/token creation, or email. The normal workflow never resets this
+state, generates a replacement claim token, or suggests using a new key.
+
+After success routing, the workflow stores only `success`, `route`, `message`,
+and the five public analysis fields at `business_complete`. SQL verifies the
+exact top-level and analysis key sets, value types, priorities, and score range.
+The separate final update requires the same key, fingerprint, claim token,
+`processing` status, `business_complete` stage, and valid stored response. If
+that final write fails, no business node runs again; the durable
+`business_complete` state remains safe for later database-only finalization.
+
+The existing hourly `n8n/flowpilot-recovery-workflow.json` remains PostgreSQL
+only. Its 30-minute Phase 8B1 email quarantine is unchanged. It additionally
+reconciles idempotency rows that have been stale for at least 60 minutes:
+
+- stale `claimed` → `failed`, because the durable business boundary was never
+  crossed;
+- stale `business_started` → `recovery_required`;
+- stale `business_complete` with a strictly valid stored public response →
+  `completed`, setting `completed_at` without invoking any business node;
+- stale `business_complete` with malformed or extra data →
+  `recovery_required`, never replayed;
+- stale legacy `processing` with a NULL stage → `recovery_required`.
+
+Fresh work, including a claim aged 59 minutes 59 seconds, remains unchanged;
+the exact 60-minute boundary is stale. Existing `completed`, `failed`, and
+`recovery_required` rows are untouched. The recovery workflow contains no HTTP,
+SMTP, AI, Google Sheets, or HubSpot node and never retries partial work. Phase
+8B1 `uncertain` email states remain quarantined and are not reset or resent.
+
+### Configure and verify Phase 8B2
+
+Apply migration `007` to an existing database before activating the updated
+lead-intake and recovery workflows:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/007_add_partial_work_reconciliation.sql'
+```
+
+Import the same four workflow JSON files into n8n `2.37.10`, reselect the local
+`FlowPilot PostgreSQL` credential on the added lead-intake nodes and the updated
+recovery node, and then activate the workflows. No new credential, secret,
+service, or workflow is introduced.
+
+Operators should investigate `recovery_required` rows together with restricted
+n8n execution history and the downstream systems before deciding anything.
+This read-only query exposes stage metadata without response content:
+
+```sql
+SELECT idempotency_key,
+       status,
+       workflow_stage,
+       stage_updated_at,
+       created_at,
+       updated_at,
+       completed_at,
+       response_payload IS NOT NULL AS has_public_response
+FROM flowpilot_idempotency
+WHERE status IN ('processing', 'recovery_required')
+ORDER BY COALESCE(stage_updated_at, updated_at, created_at), idempotency_key;
+```
+
+Do not blindly reset `recovery_required` to `processing`, `claimed`, or
+`business_started`: Sheets, HubSpot, PostgreSQL, or notification email may
+already contain the work. Phase 8B2 intentionally adds no mutation endpoint,
+retry engine, or generic job queue. Phase 8C remains responsible for broader
+observability and controlled operational tooling, not automatic replay.
+
+Run every optional reliability integration suite together against one fresh,
+disposable PostgreSQL 17 container:
+
+```powershell
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8b2-test'
+python -m pytest tests/integration/test_followup_postgres.py tests/integration/test_idempotency_postgres.py tests/integration/test_email_recovery_postgres.py tests/integration/test_partial_work_reconciliation_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+```
+
+The tests use deterministic timestamps and transactions rather than sleeps.
+They exercise migration reruns, owner-token guards, failure classification,
+strict response storage, safe finalization, legacy handling, stale/fresh/exact
+boundaries, and all earlier PostgreSQL concurrency and delivery-state behavior.
 
 ## Run tests
 
@@ -1228,9 +1373,9 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 7 (complete):** One automated follow-up after 72 hours
 - **Phase 8A (complete):** Inbound idempotency and duplicate-request protection
 - **Phase 8B1 (complete):** Email recovery and uncertain-send reconciliation
-- **Phase 8B2 (pending):** Controlled operator reconciliation policies
+- **Phase 8B2 (complete):** Stale idempotency and partial-work reconciliation
 - **Phase 8C (pending):** Reliability observability and operational controls
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 8B1 until it has been reviewed and approved.
+Development stops at Phase 8B2 until it has been reviewed and approved.

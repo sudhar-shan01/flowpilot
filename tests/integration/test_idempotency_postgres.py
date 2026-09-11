@@ -18,6 +18,8 @@ pytestmark = pytest.mark.skipif(
 WORKFLOW = json.loads((ROOT / "n8n/flowpilot-lead-workflow.json").read_text())
 NODES = {node["name"]: node for node in WORKFLOW["nodes"]}
 CLAIM = NODES["Atomically Claim Idempotency Key"]["parameters"]["query"].rstrip(";")
+START = NODES["Mark Idempotency Business Started"]["parameters"]["query"].rstrip(";")
+STORE = NODES["Record Idempotency Business Complete"]["parameters"]["query"].rstrip(";")
 COMPLETE = NODES["Mark Idempotency Completed"]["parameters"]["query"].rstrip(";")
 FAIL = NODES["Mark Idempotency Failed"]["parameters"]["query"].rstrip(";")
 
@@ -73,20 +75,24 @@ def claim(db: str, key: str, payload: str) -> dict[str, object]:
 
 
 def complete(db: str, key: str, row: dict[str, object], response: dict[str, object]):
-    query = (
-        "PREPARE fp_complete(text,text,uuid,jsonb) AS " + COMPLETE + ";"
-        + " EXECUTE fp_complete("
-        + ",".join(
-            [
-                literal(key),
-                literal(str(row["request_fingerprint"])),
-                literal(str(row["claim_token"])),
-                literal(json.dumps(response)),
-            ]
-        )
-        + ");"
+    owner = ",".join(
+        [
+            literal(key),
+            literal(str(row["request_fingerprint"])),
+            literal(str(row["claim_token"])),
+        ]
     )
-    return sql(db, query).stdout.strip()
+    query = (
+        "PREPARE fp_start(text,text,uuid) AS " + START + ";"
+        + f" EXECUTE fp_start({owner});"
+        + " PREPARE fp_store(text,text,uuid,jsonb) AS " + STORE + ";"
+        + f" EXECUTE fp_store({owner},{literal(json.dumps(response))});"
+        + " PREPARE fp_complete(text,text,uuid) AS " + COMPLETE + ";"
+        + f" EXECUTE fp_complete({owner});"
+    )
+    outputs = sql(db, query).stdout.strip().splitlines()
+    assert outputs[:2] == ["t", "t"]
+    return outputs[-1]
 
 
 def test_migration_reruns_without_data_loss(db):
@@ -177,7 +183,7 @@ def test_failed_request_is_not_blindly_replayed(db):
         )
         + ");"
     )
-    assert sql(db, query).stdout.strip() == "t"
+    assert sql(db, query).stdout.strip().split("|")[0] == "t"
     assert claim(db, "failed-key", '[["name","Example"]]')["outcome"] == "failed"
 
 
