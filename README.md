@@ -9,8 +9,9 @@ CRM contact synchronization**, and **Phase 5: internal email notifications and
 AI-generated response drafts**, **Phase 6: secure human approval**, and
 **Phase 7: one scheduled follow-up**, **Phase 8A: inbound idempotency and
 duplicate-request protection**, and **Phase 8B1: email recovery and
-uncertain-send reconciliation**, and **Phase 8B2: stale idempotency and
-partial-work reconciliation**.
+uncertain-send reconciliation**, **Phase 8B2: stale idempotency and
+partial-work reconciliation**, and **Phase 8C: reliability observability and
+audit trail**.
 
 ## Business problem
 
@@ -31,7 +32,9 @@ lead-processing side effect. Phase 8B1 adds durable email delivery claims,
 conservative SMTP outcome classification, and a database-only recovery sweep
 that quarantines stale sends instead of retrying them. Phase 8B2 records a
 minimal durable workflow stage for keyed requests and reconciles stale work
-without replaying business side effects.
+without replaying business side effects. Phase 8C adds transactionally consistent
+state-change events, sanitized recovery-run history, and read-only operational
+views without changing retry or business-processing behavior.
 
 ## Current capabilities
 
@@ -72,6 +75,10 @@ without replaying business side effects.
 - Sanitized `RECONCILIATION_REQUIRED` duplicate response for partial work
 - PostgreSQL-only reconciliation of stale idempotency state after 60 minutes
 - Safe completion of stored public responses without rerunning business work
+- Append-oriented, transactionally consistent reliability events
+- Counter-only history for every hourly recovery sweep
+- Privacy-safe reconciliation queue with operator-friendly status labels
+- Read-only reliability summary for future operator tooling
 
 ## Architecture
 
@@ -92,7 +99,7 @@ The route never calls an LLM SDK or endpoint directly. `AIService` accepts any i
 
 The health endpoint intentionally does not depend on AI credentials or provider availability.
 
-Phases 2 through 8B2 extend this architecture without changing the public webhook
+Phases 2 through 8C extend this architecture without changing the public webhook
 success contract:
 
 ```text
@@ -168,6 +175,17 @@ PostgreSQL Schedule Trigger → stale `sending` claims (30 minutes)
                               ├─ valid `business_complete` → `completed`
                               └─ legacy/unsafe state → `recovery_required`
                             → no business-side-effect replay
+                            → persist one counter-only recovery-run summary
+
+PostgreSQL observability (Phase 8C):
+
+State-changing transactions → database audit triggers
+                            → `flowpilot_reliability_events`
+                            → hashed request references / lead IDs only
+
+Operator read path → `flowpilot_reconciliation_queue`
+                   → `flowpilot_reliability_summary`
+                   → no customer content, tokens, drafts, or provider errors
 ```
 
 ## Project structure
@@ -199,10 +217,12 @@ flowpilot/
 │   ├── test_idempotency_workflow.py
 │   ├── test_email_recovery_workflow.py
 │   ├── test_partial_work_reconciliation_workflow.py
+│   ├── test_reliability_observability.py
 │   ├── integration/test_followup_postgres.py
 │   ├── integration/test_idempotency_postgres.py
 │   ├── integration/test_email_recovery_postgres.py
 │   ├── integration/test_partial_work_reconciliation_postgres.py
+│   ├── integration/test_reliability_observability_postgres.py
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
@@ -220,7 +240,10 @@ flowpilot/
 │       ├── 004_add_followups.sql
 │       ├── 005_add_idempotency.sql
 │       ├── 006_add_email_recovery.sql
-│       └── 007_add_partial_work_reconciliation.sql
+│       ├── 007_add_partial_work_reconciliation.sql
+│       └── 008_add_reliability_observability.sql
+├── docs/
+│   └── reliability-runbook.md
 ├── compose.postgres.yml
 ├── .env.example
 ├── .gitignore
@@ -1320,7 +1343,7 @@ n8n execution history and the downstream systems before deciding anything.
 This read-only query exposes stage metadata without response content:
 
 ```sql
-SELECT idempotency_key,
+SELECT encode(sha256(convert_to(idempotency_key, 'UTF8')), 'hex') AS request_ref,
        status,
        workflow_stage,
        stage_updated_at,
@@ -1353,6 +1376,91 @@ They exercise migration reruns, owner-token guards, failure classification,
 strict response storage, safe finalization, legacy handling, stale/fresh/exact
 boundaries, and all earlier PostgreSQL concurrency and delivery-state behavior.
 
+## Phase 8C: Reliability observability and audit trail
+
+Phase 8C makes the safety decisions from Phases 8A, 8B1, and 8B2 observable
+without changing them. Migration
+`postgres/init/008_add_reliability_observability.sql` is additive,
+transactional, rerunnable, and PostgreSQL 17 compatible. It creates two durable
+tables, two read-only views, narrowly scoped indexes, and database triggers for
+meaningful state changes.
+
+`flowpilot_reliability_events` is an append-oriented audit trail. Lead events
+use only the generated database lead ID. Idempotency events use a stable,
+lowercase SHA-256 reference derived from the key; the plaintext
+`Idempotency-Key` is never stored in the audit table or exposed by an
+operational view. Event names are fixed and machine-readable, including
+`lead_created`, `draft_approved`, `idempotency_business_started`,
+`idempotency_recovery_required`, `initial_email_uncertain`, and
+`followup_uncertain`.
+
+PostgreSQL `AFTER` triggers write audit events in the same transaction as the
+lead or idempotency transition. A rollback therefore removes both the state
+change and its event. `IS DISTINCT FROM` guards prevent no-op updates from
+creating duplicate events. Audit rows contain explicit status and stage
+columns only; there is no arbitrary JSON metadata field.
+
+The existing hourly recovery workflow still uses one PostgreSQL node and the
+same 30-minute email and 60-minute idempotency thresholds. Its single SQL
+statement now also inserts one row into `flowpilot_recovery_runs`, including
+when every counter is zero. A run records only sanitized totals for quarantined
+emails, failed stale claims, partial work requiring review, safe completions,
+and malformed or legacy work requiring review. It contains no customer data or
+provider output.
+
+`flowpilot_reconciliation_queue` exposes only items requiring attention:
+
+- `Needs review` for an idempotency request in `recovery_required`;
+- `Initial email delivery uncertain` for uncertain initial delivery;
+- `Follow-up delivery uncertain` for uncertain follow-up delivery.
+
+Each item has an opaque or database-local reference, friendly display status,
+separate technical state, state timestamp, age, and `requires_action` flag.
+Completed, failed, sent, and other normal terminal records do not appear.
+`flowpilot_reliability_summary` provides cheap counts plus the latest recovery
+run timestamp as a stable future dashboard contract. Neither view exposes lead
+email, message, draft content, approval tokens, response payloads, plaintext
+idempotency keys, provider errors, or credentials.
+
+Apply migration `008` before activating the updated recovery workflow:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/008_add_reliability_observability.sql'
+```
+
+Import the same four workflow exports into n8n `2.37.10` and reselect the local
+`FlowPilot PostgreSQL` credential if needed. No new workflow, credential,
+external monitoring service, retry, or replay path is introduced.
+
+Useful read-only investigation queries:
+
+```sql
+SELECT item_type, item_ref, display_status, technical_status,
+       technical_stage, state_since, age_seconds
+FROM flowpilot_reconciliation_queue
+ORDER BY state_since, item_type, item_ref;
+
+SELECT * FROM flowpilot_reliability_summary;
+
+SELECT occurred_at, entity_type, entity_ref, event_type,
+       previous_status, new_status, previous_stage, new_stage
+FROM flowpilot_reliability_events
+WHERE entity_type = 'lead' AND entity_ref = '123'
+ORDER BY occurred_at, event_id;
+
+SELECT *
+FROM flowpilot_recovery_runs
+ORDER BY ran_at DESC, run_id DESC
+LIMIT 20;
+```
+
+The operator response for each friendly state is documented in
+`docs/reliability-runbook.md`. Investigation must remain read-only until the
+operator has correlated restricted workflow and downstream-system evidence.
+Do not blindly resend uncertain email, reset `recovery_required`, or replay
+Sheets, HubSpot, drafts, notifications, or email. Phase 8C adds visibility, not
+automatic recovery.
+
 ## Run tests
 
 ```powershell
@@ -1374,8 +1482,8 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 8A (complete):** Inbound idempotency and duplicate-request protection
 - **Phase 8B1 (complete):** Email recovery and uncertain-send reconciliation
 - **Phase 8B2 (complete):** Stale idempotency and partial-work reconciliation
-- **Phase 8C (pending):** Reliability observability and operational controls
+- **Phase 8C (complete):** Reliability observability and audit trail
 - **Phase 9 (pending):** Docker deployment
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 8B2 until it has been reviewed and approved.
+Development stops at Phase 8C until it has been reviewed and approved.

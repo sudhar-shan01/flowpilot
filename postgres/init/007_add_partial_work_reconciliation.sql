@@ -4,8 +4,24 @@ ALTER TABLE flowpilot_idempotency
     ADD COLUMN IF NOT EXISTS workflow_stage VARCHAR(17),
     ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ;
 
-ALTER TABLE flowpilot_idempotency
-    ALTER COLUMN status TYPE VARCHAR(17);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'flowpilot_idempotency'
+          AND column_name = 'status'
+          AND (
+              data_type <> 'character varying'
+              OR character_maximum_length IS DISTINCT FROM 17
+          )
+    ) THEN
+        ALTER TABLE flowpilot_idempotency
+            ALTER COLUMN status TYPE VARCHAR(17);
+    END IF;
+END;
+$$;
 
 ALTER TABLE flowpilot_idempotency
     DROP CONSTRAINT IF EXISTS flowpilot_idempotency_status_check;
