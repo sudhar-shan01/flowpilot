@@ -162,6 +162,17 @@ def test_reconciliation_view_is_operator_friendly_and_read_only() -> None:
         assert forbidden not in view_sql
 
 
+def test_idempotency_queue_age_uses_recovery_transition_event() -> None:
+    view_sql = MIGRATION.split(
+        "CREATE OR REPLACE VIEW flowpilot_reconciliation_queue AS", 1
+    )[1].split("UNION ALL", 1)[0]
+    assert "event.event_type = 'idempotency_recovery_required'" in view_sql
+    assert "event.entity_type = 'idempotency'" in view_sql
+    assert "sha256(convert_to(idempotency_key, 'UTF8'))" in view_sql
+    assert view_sql.index("SELECT MAX(event.occurred_at)") < view_sql.index("updated_at")
+    assert view_sql.index("updated_at") < view_sql.index("stage_updated_at")
+
+
 def test_summary_view_has_small_stable_contract() -> None:
     for field in (
         "items_needing_reconciliation",

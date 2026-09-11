@@ -252,7 +252,21 @@ WITH queue_items AS (
         status::TEXT AS technical_status,
         workflow_stage::TEXT AS technical_stage,
         TRUE AS requires_action,
-        COALESCE(stage_updated_at, updated_at, created_at) AS state_since
+        COALESCE(
+            (
+                SELECT MAX(event.occurred_at)
+                FROM flowpilot_reliability_events AS event
+                WHERE event.entity_type = 'idempotency'
+                  AND event.entity_ref = encode(
+                      sha256(convert_to(idempotency_key, 'UTF8')),
+                      'hex'
+                  )
+                  AND event.event_type = 'idempotency_recovery_required'
+            ),
+            updated_at,
+            stage_updated_at,
+            created_at
+        ) AS state_since
     FROM flowpilot_idempotency
     WHERE status = 'recovery_required'
 

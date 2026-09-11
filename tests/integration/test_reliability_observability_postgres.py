@@ -491,6 +491,84 @@ def test_reconciliation_queue_contains_only_attention_items(db):
     ]
 
 
+def test_idempotency_queue_age_starts_at_recovery_required_transition(db):
+    key = "recent-recovery-transition"
+    insert_idempotency(db, key, stage="business_started", age="61 minutes")
+    sql(
+        db,
+        "UPDATE flowpilot_idempotency SET status='recovery_required',updated_at=NOW() "
+        f"WHERE idempotency_key={literal(key)};",
+    )
+    result = sql(
+        db,
+        "SELECT queue.state_since = event.occurred_at,"
+        "queue.state_since > idem.stage_updated_at + INTERVAL '60 minutes',"
+        "queue.age_seconds BETWEEN 0 AND 5 "
+        "FROM flowpilot_reconciliation_queue AS queue "
+        "JOIN flowpilot_idempotency AS idem ON queue.item_ref = "
+        "encode(sha256(convert_to(idem.idempotency_key,'UTF8')),'hex') "
+        "JOIN LATERAL (SELECT MAX(occurred_at) AS occurred_at "
+        "FROM flowpilot_reliability_events WHERE entity_type='idempotency' "
+        "AND entity_ref=queue.item_ref "
+        "AND event_type='idempotency_recovery_required') AS event ON TRUE "
+        f"WHERE idem.idempotency_key={literal(key)};",
+    ).stdout.strip()
+    assert result == "t|t|t"
+
+
+def test_stale_recovery_queue_age_starts_at_sweep_not_business_start(db):
+    key = "sweep-recovery-transition"
+    insert_idempotency(db, key, stage="business_started", age="61 minutes")
+    counts = recover(db)
+    assert counts[3] == 1
+    result = sql(
+        db,
+        "SELECT queue.state_since = event.occurred_at,"
+        "queue.state_since > idem.stage_updated_at + INTERVAL '60 minutes',"
+        "queue.age_seconds BETWEEN 0 AND 5 "
+        "FROM flowpilot_reconciliation_queue AS queue "
+        "JOIN flowpilot_idempotency AS idem ON queue.item_ref = "
+        "encode(sha256(convert_to(idem.idempotency_key,'UTF8')),'hex') "
+        "JOIN LATERAL (SELECT MAX(occurred_at) AS occurred_at "
+        "FROM flowpilot_reliability_events WHERE entity_type='idempotency' "
+        "AND entity_ref=queue.item_ref "
+        "AND event_type='idempotency_recovery_required') AS event ON TRUE "
+        f"WHERE idem.idempotency_key={literal(key)};",
+    ).stdout.strip()
+    assert result == "t|t|t"
+
+
+def test_historical_recovery_required_uses_updated_at_fallback(db):
+    key = "historical-recovery-without-event"
+    insert_idempotency(
+        db,
+        key,
+        status="recovery_required",
+        stage="business_started",
+        age="10 minutes",
+    )
+    sql(
+        db,
+        "UPDATE flowpilot_idempotency SET stage_updated_at=NOW()-INTERVAL '61 minutes',"
+        "created_at=NOW()-INTERVAL '2 hours' "
+        f"WHERE idempotency_key={literal(key)};",
+    )
+    result = sql(
+        db,
+        "SELECT queue.state_since = idem.updated_at,"
+        "queue.state_since > idem.stage_updated_at,"
+        "queue.age_seconds BETWEEN 595 AND 605,"
+        "NOT EXISTS (SELECT 1 FROM flowpilot_reliability_events "
+        "WHERE entity_type='idempotency' AND entity_ref=queue.item_ref "
+        "AND event_type='idempotency_recovery_required') "
+        "FROM flowpilot_reconciliation_queue AS queue "
+        "JOIN flowpilot_idempotency AS idem ON queue.item_ref = "
+        "encode(sha256(convert_to(idem.idempotency_key,'UTF8')),'hex') "
+        f"WHERE idem.idempotency_key={literal(key)};",
+    ).stdout.strip()
+    assert result == "t|t|t|t"
+
+
 def test_views_and_events_do_not_expose_sensitive_content(db):
     lead_id = seed_lead(db, "-privacy")
     token = "00000000-0000-4000-8000-000000000123"
