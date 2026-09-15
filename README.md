@@ -58,6 +58,16 @@ from `n8n/`, and select credentials with these exact names where applicable:
 - `FlowPilot HubSpot`
 - `FlowPilot Email`
 
+For the full-stack Compose quickstart, configure the `FlowPilot PostgreSQL`
+credential with the internal Docker service address:
+
+- Host: `postgres`
+- Port: `5432`
+- Database: `flowpilot` (or the local `POSTGRES_DB` value)
+- User: `flowpilot` (or the local `POSTGRES_USER` value)
+- Password: the local `POSTGRES_PASSWORD` value
+- SSL: disabled for local Compose
+
 Workflow import is intentionally manual. Compose mounts the exports read-only at
 `/opt/flowpilot-workflows` for inspection but never imports them on startup, so a
 restart cannot create duplicate workflows or credentials.
@@ -652,7 +662,8 @@ docker compose -f compose.postgres.yml ps
 The first startup runs `postgres/init/001_create_leads.sql`. PostgreSQL stores
 `TIMESTAMPTZ` values as UTC instants, and the local container is explicitly set
 to UTC. The named Docker volume preserves data across ordinary container
-restarts. The application itself is not Dockerized.
+restarts. This legacy setup starts only PostgreSQL; run the API and n8n using the
+host or hybrid instructions below.
 
 If the named volume already existed before the schema file was added, init
 scripts will not run again. Apply the SQL file manually or recreate only this
@@ -669,8 +680,16 @@ local `.env`:
 - Password: the local `POSTGRES_PASSWORD`
 - Port: `5432` (or `POSTGRES_PORT`)
 - SSL: disabled for this local-only database
-- Host when n8n runs on the host: `127.0.0.1`
-- Host when n8n runs in Docker Desktop: `host.docker.internal`
+
+Choose the host for the topology you are running:
+
+- **Full-stack Compose:** the n8n container connects to the PostgreSQL service
+  on the shared Compose network. Use host `postgres` and port `5432`.
+- **Legacy/hybrid mode:** when n8n runs in Docker Desktop and PostgreSQL is
+  published on the host by `compose.postgres.yml`, use host
+  `host.docker.internal`.
+- **Host-native n8n:** when n8n runs directly on the host and PostgreSQL is
+  published by `compose.postgres.yml`, use host `127.0.0.1`.
 
 n8n encrypts credential values in its own credential store. Do not paste the
 password into the workflow node or commit it to this repository. After choosing

@@ -117,3 +117,20 @@ def test_product_docs_cover_quickstart_and_safe_failure_model() -> None:
     assert "exactly-once" in readme
     assert "docs/demo.md" in readme
     assert "docs/development-history.md" in readme
+
+
+def test_postgres_credentials_distinguish_compose_from_hybrid_networking() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    quickstart = readme.split("## Quick start", maxsplit=1)[1].split(
+        "## Architecture", maxsplit=1
+    )[0]
+
+    assert "full-stack Compose quickstart" in quickstart
+    assert "Host: `postgres`" in quickstart
+    assert "Port: `5432`" in quickstart
+    assert "host.docker.internal" not in quickstart
+    assert "The application itself is not Dockerized." not in readme
+
+    assert "**Full-stack Compose:**" in readme
+    assert "**Legacy/hybrid mode:**" in readme
+    assert "`host.docker.internal`" in readme
