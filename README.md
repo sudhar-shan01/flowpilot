@@ -1,17 +1,179 @@
 # FlowPilot
 
-FlowPilot is a portfolio-grade, AI-powered business workflow automation platform. The project is being built incrementally to demonstrate practical Python, API, AI, integration, reliability, and deployment skills without hiding the core ideas behind unnecessary infrastructure.
+Reliable AI-assisted lead automation with human approval, idempotency,
+partial-failure recovery, and operational reconciliation.
 
-This repository currently contains **Phase 1: the AI Lead Analysis API**,
-**Phase 2: n8n webhook intake and priority routing**, **Phase 3A: PostgreSQL
-persistence**, **Phase 3B: Google Sheets persistence**, **Phase 4: HubSpot
-CRM contact synchronization**, and **Phase 5: internal email notifications and
-AI-generated response drafts**, **Phase 6: secure human approval**, and
-**Phase 7: one scheduled follow-up**, **Phase 8A: inbound idempotency and
-duplicate-request protection**, and **Phase 8B1: email recovery and
-uncertain-send reconciliation**, **Phase 8B2: stale idempotency and
-partial-work reconciliation**, and **Phase 8C: reliability observability and
-audit trail**.
+FlowPilot combines a small FastAPI service, PostgreSQL 17, and n8n 2.37.10. It
+validates and analyzes inbound leads, records durable state, coordinates CRM and
+spreadsheet integrations, creates response drafts, requires explicit human
+approval before lead email, and quarantines work whose external outcome cannot
+be proved.
+
+## Why FlowPilot exists
+
+Real automation fails between steps. A database write can succeed before a CRM
+call fails. Two copies of the same request can arrive concurrently. An SMTP
+connection can disappear after the server accepted a message. A process can
+crash after an external side effect but before recording completion.
+
+FlowPilot makes those boundaries visible and recoverable. It uses atomic
+ownership claims, persisted workflow stages, human approval, conservative email
+delivery states, transactional audit events, and a privacy-safe reconciliation
+queue. It does not claim exactly-once distributed delivery; uncertain outcomes
+are held for investigation instead of being replayed blindly.
+
+## Quick start
+
+Docker is the only runtime prerequisite. Python, PostgreSQL, and n8n do not need
+to be installed on the host.
+
+```powershell
+git clone https://github.com/sudhar-shan01/flowpilot.git
+cd flowpilot
+Copy-Item .env.example .env
+# Set POSTGRES_PASSWORD and N8N_ENCRYPTION_KEY in .env.
+docker compose up --build
+```
+
+For bash or zsh, replace the copy command with `cp .env.example .env`. The
+example leaves secrets blank. Before starting Compose, set `POSTGRES_PASSWORD`
+and `N8N_ENCRYPTION_KEY` in `.env` to strong local values. Keep `.env` untracked.
+
+Once the containers are healthy:
+
+- API: <http://localhost:8000>
+- Swagger: <http://localhost:8000/docs>
+- Health: <http://localhost:8000/health>
+- n8n: <http://localhost:5678>
+
+The API health and documentation endpoints work without external credentials.
+AI analysis and drafts require `OPENAI_API_KEY`. HubSpot, Google Sheets, and
+SMTP remain disabled until their local n8n credentials are configured.
+
+On first n8n startup, create the local owner account, import the four JSON files
+from `n8n/`, and select credentials with these exact names where applicable:
+
+- `FlowPilot PostgreSQL`
+- `FlowPilot Google Sheets`
+- `FlowPilot HubSpot`
+- `FlowPilot Email`
+
+Workflow import is intentionally manual. Compose mounts the exports read-only at
+`/opt/flowpilot-workflows` for inspection but never imports them on startup, so a
+restart cannot create duplicate workflows or credentials.
+
+Stop the stack without deleting data:
+
+```powershell
+docker compose down
+```
+
+Named volumes preserve PostgreSQL and n8n state. `docker compose down --volumes`
+deletes that local state and should only be used when a deliberate reset is
+required.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Lead[Lead] --> Intake[Webhook + idempotency]
+    Intake --> AI[AI analysis]
+    AI --> DB[(PostgreSQL)]
+    DB --> Sheets[Google Sheets]
+    DB --> HubSpot[HubSpot]
+    HubSpot --> Draft[Response draft]
+    Draft --> Approval[Human approval]
+    Approval --> Email[Email]
+    Email --> Followup[One scheduled follow-up]
+
+    Audit[Transactional audit events] --> Recovery[Recovery sweep]
+    Recovery --> Queue[Reconciliation queue]
+    DB -. state changes .-> Audit
+    Queue -. operator investigation .-> DB
+```
+
+The Compose startup path is deterministic:
+
+```text
+PostgreSQL healthy
+        ↓
+migrations 001 → 008 succeed
+        ↓
+FlowPilot API healthy
+        ↓
+n8n starts with http://flowpilot-api:8000 as its internal API URL
+```
+
+PostgreSQL is not published to the host in the full stack. Only API port `8000`
+and n8n port `5678` are published. The normal container path does not use
+`host.docker.internal`.
+
+## Reliability model
+
+- Optional idempotency keys are claimed atomically before business side effects.
+- A matching completed request replays only its allowlisted public response.
+- Durable stages distinguish safe retry from partial work requiring review.
+- Approval links are expiring and single use; GET remains side-effect-free.
+- Initial and follow-up email sends use atomic delivery claims.
+- Ambiguous SMTP outcomes become `uncertain` and are never resent automatically.
+- Database triggers record meaningful state transitions in the same transaction.
+- Recovery sweeps mutate only states whose safe transition is known.
+- Operational views exclude customer messages, drafts, tokens, credentials, and
+  plaintext idempotency keys.
+
+See [the reliability runbook](docs/reliability-runbook.md) for investigation
+procedures and safe operator actions.
+
+## Demo and deeper documentation
+
+- [Five-minute product and reliability demo](docs/demo.md)
+- [Development history and capability milestones](docs/development-history.md)
+- [Reliability incident runbook](docs/reliability-runbook.md)
+- [Changelog](CHANGELOG.md)
+
+## Reproducible development
+
+`requirements.txt` remains the readable direct dependency declaration.
+`requirements.runtime.lock` pins the complete API runtime graph used by the
+Docker image, and `requirements.dev.lock` pins the runtime plus test tooling.
+The Python, PostgreSQL, and n8n image references retain readable version tags
+and pin their manifest digests so a later registry update cannot silently change
+the verified images.
+
+Create a local Python 3.11 environment with the exact development set:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --no-deps -r requirements.dev.lock
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m pytest
+```
+
+To update dependencies intentionally, create a clean Python 3.11 environment,
+install the bounded direct requirements from `requirements.txt`, inspect the
+resolved dependency graph with `python -m pip check`, then replace both lock
+files from `python -m pip freeze`. Remove packaging tools such as `pip` and
+`setuptools` from the locks, keep `pytest` and its dependencies only in the
+development lock, and run the full test and Docker build gates before commit.
+
+## Migrations and existing installations
+
+The one-shot `migrations` service runs `run-migrations.sql` with
+`ON_ERROR_STOP`. That file lists migrations `001` through `008` explicitly in
+numeric order. Every migration is rerunnable, so the same path supports a fresh
+database and an existing volume. A failed migration exits nonzero and prevents
+the API and n8n services from starting; Compose never recreates the database to
+hide a migration failure.
+
+Run the migration service again without restarting the stack:
+
+```powershell
+docker compose run --rm migrations
+```
+
+The legacy `compose.postgres.yml` remains available for database-only local
+development and the optional PostgreSQL integration suites. The root
+`compose.yml` is the supported reviewer quickstart.
 
 ## Business problem
 
@@ -226,7 +388,8 @@ flowpilot/
 │   ├── test_lead_drafts.py
 │   ├── test_leads.py
 │   ├── test_n8n_workflow.py
-│   └── test_postgres_persistence.py
+│   ├── test_postgres_persistence.py
+│   └── test_docker_packaging.py
 ├── n8n/
 │   ├── flowpilot-lead-workflow.json
 │   ├── flowpilot-approval-workflow.json
@@ -243,8 +406,17 @@ flowpilot/
 │       ├── 007_add_partial_work_reconciliation.sql
 │       └── 008_add_reliability_observability.sql
 ├── docs/
+│   ├── demo.md
+│   ├── development-history.md
 │   └── reliability-runbook.md
+├── .dockerignore
+├── Dockerfile
+├── compose.yml
 ├── compose.postgres.yml
+├── run-migrations.sql
+├── requirements.runtime.lock
+├── requirements.dev.lock
+├── CHANGELOG.md
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -253,13 +425,12 @@ flowpilot/
 
 ## Installation
 
-Python 3.11 or newer is required.
+Python 3.11 is the supported local development runtime.
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps -r requirements.dev.lock
+.\.venv\Scripts\python.exe -m pip check
 ```
 
 On macOS or Linux, activate the environment with `source .venv/bin/activate`.
@@ -1483,7 +1654,7 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 8B1 (complete):** Email recovery and uncertain-send reconciliation
 - **Phase 8B2 (complete):** Stale idempotency and partial-work reconciliation
 - **Phase 8C (complete):** Reliability observability and audit trail
-- **Phase 9 (pending):** Docker deployment
+- **Phase 9 (complete):** Containerized deployment and reproducible packaging
 - **Phase 10 (pending):** Cloud deployment
 
-Development stops at Phase 8C until it has been reviewed and approved.
+Development stops at Phase 9 until it has been reviewed and approved.

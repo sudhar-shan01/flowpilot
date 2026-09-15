@@ -18,7 +18,10 @@ def create_app() -> FastAPI:
 
     application = FastAPI(
         title=settings.app_name,
-        description="AI-powered business lead analysis API.",
+        description=(
+            "Reliable AI-assisted lead analysis and response-draft API for the "
+            "FlowPilot automation system."
+        ),
         version="0.1.0",
     )
     application.include_router(health.router)

@@ -1,0 +1,114 @@
+name: flowpilot
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flowpilot}
+      POSTGRES_USER: ${POSTGRES_USER:-flowpilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env file}
+      TZ: UTC
+    command: ["postgres", "-c", "timezone=UTC"]
+    volumes:
+      - flowpilot_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  migrations:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-flowpilot}
+      PGUSER: ${POSTGRES_USER:-flowpilot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env file}
+    volumes:
+      - ./postgres/init:/migrations/postgres/init:ro
+      - ./run-migrations.sql:/migrations/run-migrations.sql:ro
+    command:
+      - /bin/sh
+      - -ec
+      - exec psql --set=ON_ERROR_STOP=1 --file=/migrations/run-migrations.sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  flowpilot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      FLOWPILOT_AI_PROVIDER: ${FLOWPILOT_AI_PROVIDER:-openai}
+      FLOWPILOT_OPENAI_MODEL: ${FLOWPILOT_OPENAI_MODEL:-gpt-4o-mini}
+      FLOWPILOT_OPENAI_BASE_URL: ${FLOWPILOT_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      FLOWPILOT_AI_TIMEOUT_SECONDS: ${FLOWPILOT_AI_TIMEOUT_SECONDS:-20}
+      FLOWPILOT_LOG_LEVEL: ${FLOWPILOT_LOG_LEVEL:-INFO}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "${FLOWPILOT_API_PORT:-8000}:8000"
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    init: true
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:2.37.10@sha256:307d6065be25619aa24cfc63a7c2f04ca56d084a08c05c8e9f189a89f353b1ec
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_EDITOR_BASE_URL: http://localhost:${FLOWPILOT_N8N_PORT:-5678}
+      WEBHOOK_URL: http://localhost:${FLOWPILOT_N8N_PORT:-5678}/
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY in your local .env file}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_TEMPLATES_ENABLED: "false"
+      GENERIC_TIMEZONE: UTC
+      TZ: UTC
+      FLOWPILOT_API_URL: http://flowpilot-api:8000
+      FLOWPILOT_INTERNAL_EMAIL_TO: ${FLOWPILOT_INTERNAL_EMAIL_TO:-}
+      FLOWPILOT_INTERNAL_EMAIL_FROM: ${FLOWPILOT_INTERNAL_EMAIL_FROM:-}
+      FLOWPILOT_APPROVAL_URL: ${FLOWPILOT_APPROVAL_URL:-http://localhost:5678/webhook/flowpilot/approval}
+      FLOWPILOT_LEAD_EMAIL_FROM: ${FLOWPILOT_LEAD_EMAIL_FROM:-}
+    ports:
+      - "${FLOWPILOT_N8N_PORT:-5678}:5678"
+    volumes:
+      - flowpilot_n8n_data:/home/node/.n8n
+      - ./n8n:/opt/flowpilot-workflows:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5678/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      flowpilot-api:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+volumes:
+  flowpilot_postgres_data:
+  flowpilot_n8n_data:

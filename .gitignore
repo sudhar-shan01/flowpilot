@@ -7,3 +7,8 @@ __pycache__/
 htmlcov/
 .idea/
 .vscode/
+*.log
+*.tmp
+*.swp
+Thumbs.db
+.DS_Store
