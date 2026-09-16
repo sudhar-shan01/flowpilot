@@ -4,7 +4,7 @@ import logging
 
 from fastapi import FastAPI
 
-from app.api.routes import health, leads
+from app.api.routes import health, ingress, leads
 from app.core.config import get_settings
 
 
@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
     )
     application.include_router(health.router)
+    application.include_router(ingress.router)
     application.include_router(leads.router)
     return application
 

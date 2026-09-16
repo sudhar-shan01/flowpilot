@@ -4,6 +4,10 @@
 
 ### Major development milestones
 
+- Added a GCP single-VM production deployment layer with Caddy-managed TLS,
+  loopback-only administration, private PostgreSQL networking, required trusted
+  lead-ingress authentication, bounded n8n execution retention, and backup/
+  restore guidance. No cloud resources are provisioned by the repository.
 - Added a containerized local stack for the FlowPilot API, PostgreSQL 17, and
   n8n 2.37.10, with ordered migrations and persistent volumes.
 - Added reproducible Python runtime and development dependency locks.

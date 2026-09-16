@@ -11,6 +11,8 @@ services:
     command: ["postgres", "-c", "timezone=UTC"]
     volumes:
       - flowpilot_postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
     healthcheck:
       test:
         [
@@ -41,6 +43,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - backend
     restart: "no"
 
   flowpilot-api:
@@ -55,7 +59,10 @@ services:
       FLOWPILOT_LOG_LEVEL: ${FLOWPILOT_LOG_LEVEL:-INFO}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ports:
-      - "${FLOWPILOT_API_PORT:-8000}:8000"
+      - "${FLOWPILOT_BIND_ADDRESS:-0.0.0.0}:${FLOWPILOT_API_PORT:-8000}:8000"
+    networks:
+      - backend
+      - edge
     depends_on:
       migrations:
         condition: service_completed_successfully
@@ -85,10 +92,13 @@ services:
       FLOWPILOT_APPROVAL_URL: ${FLOWPILOT_APPROVAL_URL:-http://localhost:5678/webhook/flowpilot/approval}
       FLOWPILOT_LEAD_EMAIL_FROM: ${FLOWPILOT_LEAD_EMAIL_FROM:-}
     ports:
-      - "${FLOWPILOT_N8N_PORT:-5678}:5678"
+      - "${FLOWPILOT_BIND_ADDRESS:-0.0.0.0}:${FLOWPILOT_N8N_PORT:-5678}:5678"
     volumes:
       - flowpilot_n8n_data:/home/node/.n8n
       - ./n8n:/opt/flowpilot-workflows:ro
+    networks:
+      - backend
+      - edge
     healthcheck:
       test:
         [
@@ -112,3 +122,8 @@ services:
 volumes:
   flowpilot_postgres_data:
   flowpilot_n8n_data:
+
+networks:
+  backend:
+    internal: true
+  edge:
