@@ -93,8 +93,9 @@ Set every required value without printing it to deployment logs:
 
 - `POSTGRES_PASSWORD`: strong database password
 - `N8N_ENCRYPTION_KEY`: long random key; escrow it independently
-- `FLOWPILOT_WEBHOOK_INGRESS_SECRET`: at least 32 random bytes shared only with
-  trusted lead sources
+- `FLOWPILOT_WEBHOOK_INGRESS_SECRET`: the application enforces at least 32
+  characters. Use an ASCII hex or base64url value generated from at least 32
+  random bytes and share it only with trusted lead sources.
 - `FLOWPILOT_CADDY_SITE`: domain for automatic HTTPS, for example
   `flowpilot.example.com`
 - `FLOWPILOT_PUBLIC_HOST`: host only, for example `flowpilot.example.com`

@@ -16,7 +16,7 @@ effects.
 
 | Risk | Phase 10A control | Residual risk |
 | --- | --- | --- |
-| Untrusted callers trigger the lead workflow | HTTPS plus required `X-FlowPilot-Webhook-Secret`; internal verifier uses fixed-length SHA-256 digests and constant-time comparison | A trusted source can still be compromised; rotate the secret and investigate downstream state |
+| Untrusted callers trigger the lead workflow | HTTPS plus required `X-FlowPilot-Webhook-Secret`; configuration rejects values shorter than 32 characters, and the internal verifier uses fixed-length SHA-256 digests and constant-time comparison | A trusted source can still be compromised; use an ASCII value generated from at least 32 random bytes, rotate it, and investigate downstream state |
 | n8n editor or FastAPI docs exposed publicly | Only Caddy publishes public ports; n8n and API bind to VM loopback for SSH tunneling | A user with VM access remains trusted |
 | PostgreSQL exposed to the internet | No host port; database joins only the internal Docker backend network | Single-host compromise can reach container networks |
 | Approval-link scanner causes a decision | Existing GET is display-only; explicit POST and atomic token checks remain required | Anyone who steals an unexpired URL may submit the decision |

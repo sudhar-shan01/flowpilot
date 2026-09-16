@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.api.routes import ingress
 from app.core.config import Settings, get_settings
@@ -15,6 +17,28 @@ def configure_secret(value: str | None) -> None:
     app.dependency_overrides[get_settings] = lambda: Settings(
         webhook_ingress_secret=value
     )
+
+
+def test_ingress_secret_configuration_allows_unset_value() -> None:
+    settings = Settings(webhook_ingress_secret=None)
+
+    assert settings.webhook_ingress_secret is None
+
+
+def test_ingress_secret_configuration_accepts_32_characters() -> None:
+    secret = "a" * 32
+
+    settings = Settings(webhook_ingress_secret=secret)
+
+    assert settings.webhook_ingress_secret is not None
+    assert settings.webhook_ingress_secret.get_secret_value() == secret
+
+
+def test_ingress_secret_configuration_rejects_short_value() -> None:
+    with pytest.raises(ValidationError) as error:
+        Settings(webhook_ingress_secret="a" * 31)
+
+    assert error.value.errors()[0]["type"] == "too_short"
 
 
 def test_local_ingress_remains_compatible_when_secret_is_unset(
