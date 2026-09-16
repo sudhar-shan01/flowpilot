@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
     ai_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    webhook_ingress_secret: SecretStr | None = Field(default=None, min_length=32)
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -53,8 +53,8 @@ def test_compose_defines_only_the_expected_runtime_services() -> None:
 
 
 def test_compose_publishes_only_api_and_n8n() -> None:
-    assert '${FLOWPILOT_API_PORT:-8000}:8000' in COMPOSE
-    assert '${FLOWPILOT_N8N_PORT:-5678}:5678' in COMPOSE
+    assert '${FLOWPILOT_BIND_ADDRESS:-0.0.0.0}:${FLOWPILOT_API_PORT:-8000}:8000' in COMPOSE
+    assert '${FLOWPILOT_BIND_ADDRESS:-0.0.0.0}:${FLOWPILOT_N8N_PORT:-5678}:5678' in COMPOSE
     postgres_section = COMPOSE.split("  migrations:", maxsplit=1)[0]
     assert "ports:" not in postgres_section
     assert "5432:5432" not in COMPOSE
@@ -76,6 +76,8 @@ def test_compose_uses_persistent_data_without_privileged_access() -> None:
 
 def test_migration_runner_is_fail_fast_complete_and_ordered() -> None:
     assert "\\set ON_ERROR_STOP on" in MIGRATION_RUNNER
+    assert "pg_advisory_lock" in MIGRATION_RUNNER
+    assert "pg_advisory_unlock" in MIGRATION_RUNNER
     referenced = re.findall(r"postgres/init/(\d{3}_[a-z0-9_]+\.sql)", MIGRATION_RUNNER)
     committed = sorted(path.name for path in (ROOT / "postgres/init").glob("*.sql"))
     assert referenced == committed

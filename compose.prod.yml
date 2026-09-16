@@ -1,0 +1,79 @@
+services:
+  postgres:
+    security_opt:
+      - no-new-privileges:true
+
+  migrations:
+    security_opt:
+      - no-new-privileges:true
+
+  flowpilot-api:
+    environment:
+      FLOWPILOT_WEBHOOK_INGRESS_SECRET: ${FLOWPILOT_WEBHOOK_INGRESS_SECRET:?Set FLOWPILOT_WEBHOOK_INGRESS_SECRET in the production environment file}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  n8n:
+    user: node
+    environment:
+      N8N_HOST: ${FLOWPILOT_PUBLIC_HOST:?Set FLOWPILOT_PUBLIC_HOST in the production environment file}
+      N8N_PROTOCOL: ${FLOWPILOT_PUBLIC_PROTOCOL:-https}
+      N8N_EDITOR_BASE_URL: http://localhost:${FLOWPILOT_N8N_PORT:-5678}
+      WEBHOOK_URL: ${FLOWPILOT_PUBLIC_ORIGIN:?Set FLOWPILOT_PUBLIC_ORIGIN in the production environment file}/
+      FLOWPILOT_APPROVAL_URL: ${FLOWPILOT_PUBLIC_ORIGIN:?Set FLOWPILOT_PUBLIC_ORIGIN in the production environment file}/webhook/flowpilot/approval
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: ${N8N_EXECUTIONS_DATA_MAX_AGE:-168}
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: ${N8N_EXECUTIONS_DATA_PRUNE_MAX_COUNT:-10000}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    environment:
+      FLOWPILOT_CADDY_SITE: ${FLOWPILOT_CADDY_SITE:?Set FLOWPILOT_CADDY_SITE in the production environment file}
+    ports:
+      - "${FLOWPILOT_HTTP_PORT:-80}:80"
+      - "${FLOWPILOT_HTTPS_PORT:-443}:443"
+      - "${FLOWPILOT_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - flowpilot_caddy_data:/data
+      - flowpilot_caddy_config:/config
+    networks:
+      - edge
+    depends_on:
+      flowpilot-api:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  flowpilot_caddy_data:
+  flowpilot_caddy_config:

@@ -1,0 +1,46 @@
+{
+	admin 127.0.0.1:2019
+}
+
+{$FLOWPILOT_CADDY_SITE} {
+	encode zstd gzip
+
+	header {
+		-Server
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+
+	@health path /health
+	handle @health {
+		reverse_proxy flowpilot-api:8000
+	}
+
+	@lead path /webhook/flowpilot/lead
+	handle @lead {
+		request_body {
+			max_size 64KB
+		}
+		forward_auth flowpilot-api:8000 {
+			uri /internal/ingress/verify
+			header_up X-FlowPilot-Webhook-Secret {http.request.header.X-FlowPilot-Webhook-Secret}
+		}
+		reverse_proxy n8n:5678 {
+			header_up -X-FlowPilot-Webhook-Secret
+		}
+	}
+
+	@approval path /webhook/flowpilot/approval
+	handle @approval {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy n8n:5678
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+}
