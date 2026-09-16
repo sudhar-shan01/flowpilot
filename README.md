@@ -139,18 +139,19 @@ procedures and safe operator actions.
 - [Five-minute product and reliability demo](docs/demo.md)
 - [Development history and capability milestones](docs/development-history.md)
 - [Reliability incident runbook](docs/reliability-runbook.md)
-- [GCP single-VM pilot deployment](docs/gcp-deployment.md)
+- [OCI single-VM pilot deployment](docs/oci-deployment.md)
 - [Deployment threat assessment](docs/deployment-threat-model.md)
 - [Changelog](CHANGELOG.md)
 
 ## Production deployment readiness
 
 Phase 10A adds a reviewed production layer without changing the verified local
-quickstart. Use `compose.yml` plus `compose.prod.yml` on a Google Compute Engine
-pilot VM. Caddy is the only public container; it terminates TLS and routes only
+quickstart. Use `compose.yml` plus `compose.prod.yml` on an Oracle Cloud
+Infrastructure pilot VM. Caddy is the only public container; it terminates TLS
+and routes only
 `/health`, the authenticated lead webhook, and the token-protected approval
 webhook. API documentation and the n8n editor remain on VM loopback for an SSH
-or IAP tunnel, and PostgreSQL has no public port.
+or OCI Bastion tunnel, and PostgreSQL has no public port.
 
 Trusted lead sources send a strong shared value in
 `X-FlowPilot-Webhook-Secret`. Caddy asks the internal API verifier to authorize
@@ -158,10 +159,10 @@ the request, then removes that header before n8n receives it. Local deployments
 remain backward compatible when the secret is unset; the production Compose
 layer refuses to render without it.
 
-This repository does not provision GCP resources. Read
-[`docs/gcp-deployment.md`](docs/gcp-deployment.md) and obtain owner decisions on
-project, region, domain, budget, IAM, secrets, and backup retention before any
-live action.
+This repository does not provision OCI resources. Read
+[`docs/oci-deployment.md`](docs/oci-deployment.md) and obtain owner decisions on
+tenancy, home region, Ampere A1 capacity, domain, budget, IAM, secrets, and
+backup retention before any live action.
 
 ## Reproducible development
 
@@ -1696,7 +1697,7 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 8B2 (complete):** Stale idempotency and partial-work reconciliation
 - **Phase 8C (complete):** Reliability observability and audit trail
 - **Phase 9 (complete):** Containerized deployment and reproducible packaging
-- **Phase 10A (pending review):** GCP pilot deployment readiness and ingress security
+- **Phase 10A (pending review):** OCI pilot deployment readiness and ingress security
 - **Phase 10 live provisioning (pending owner approval):** no cloud resources created
 
-Development stops at Phase 10A pending review. No live GCP deployment has begun.
+Development stops at Phase 10A pending review. No live OCI deployment has begun.

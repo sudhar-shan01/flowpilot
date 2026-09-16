@@ -88,12 +88,14 @@ def test_production_example_contains_only_placeholders() -> None:
     assert "!.env.prod.example" in ignored
 
 
-def test_gcp_runbook_covers_full_pilot_lifecycle_and_boundaries() -> None:
-    runbook = (ROOT / "docs" / "gcp-deployment.md").read_text(encoding="utf-8")
+def test_oci_runbook_covers_full_pilot_lifecycle_and_boundaries() -> None:
+    runbook = (ROOT / "docs" / "oci-deployment.md").read_text(encoding="utf-8")
     for heading in (
         "Prerequisites",
         "VM recommendation",
-        "Firewall and network paths",
+        "Always Free and capacity caveats",
+        "ARM64 image compatibility",
+        "OCI network and firewall paths",
         "Production environment and secrets",
         "Start and verify",
         "n8n first-time setup",
@@ -110,6 +112,21 @@ def test_gcp_runbook_covers_full_pilot_lifecycle_and_boundaries() -> None:
     assert "single point of failure" in runbook
     assert "exactly-once" in runbook
     assert "Phase 10 does not build" in runbook
+    assert "VM.Standard.A1.Flex" in runbook
+    assert "Ubuntu 24.04" in runbook
+    assert "linux/arm64" in runbook
+    assert "reserved public IPv4" in runbook
+    assert "5432" in runbook and "5678" in runbook and "8000" in runbook
+    for removed_reference in (
+        "Google Compute Engine",
+        "GCE",
+        "IAP",
+        "GCP project",
+        "Google Secret Manager",
+        "gcp-deployment.md",
+    ):
+        assert removed_reference not in runbook
+    assert not (ROOT / "docs" / "gcp-deployment.md").exists()
 
 
 def test_production_compose_renders_with_synthetic_configuration(tmp_path: Path) -> None:

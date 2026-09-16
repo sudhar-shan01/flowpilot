@@ -1,43 +1,87 @@
-# Google Cloud pilot deployment
+# Oracle Cloud pilot deployment
 
 This runbook prepares a professional single-VM pilot. It does not provision
-resources automatically and does not create chargeable Google Cloud resources.
-Review the architecture, costs, region, domain, and backup policy before a live
-deployment.
+resources automatically and does not create paid Oracle Cloud Infrastructure
+(OCI) resources. Review the architecture, current Free Tier terms, capacity,
+costs, home region, domain, and backup policy before a live deployment.
 
 ## Prerequisites
 
 - A reviewed FlowPilot commit or tag
-- A Google Cloud project with billing controlled by the owner
-- Permission to manage one Compute Engine VM, firewall rules, and optionally
-  Secret Manager and persistent-disk snapshots
+- An OCI tenancy and compartment with an owner-selected home region
+- Permission to manage one Compute instance, its VCN/VNIC, network security
+  group (NSG) or security list, public IP, and boot-volume backups
 - A domain you control for trusted production webhooks, or an external IP for
   temporary infrastructure testing only
 - Docker Engine and Docker Compose v2 on the VM
 - External provider accounts only for integrations the pilot will use
 
 Do not create resources from this repository blindly. The owner must choose the
-GCP project, region, machine class, domain, budget, and retention policy.
+OCI tenancy, compartment, home region, availability domain, shape, domain,
+budget controls, and retention policy. Account creation commonly requires
+identity verification and a payment card; the owner must review current Oracle
+terms before proceeding.
 
 ## VM recommendation
 
-Start with an Ubuntu 24.04 LTS Compute Engine VM with 2 vCPUs, 8 GB RAM, and at
-least a 40 GB balanced persistent boot disk. Place Docker's data directory on
-durable persistent-disk storage. Enable automatic restart and OS Login where
-appropriate. Size CPU, memory, disk, and IOPS from observed pilot traffic.
+Prefer an Always Free-eligible `VM.Standard.A1.Flex` Ampere A1 instance where
+capacity exists. A practical pilot allocation is 2 OCPUs and 12 GB RAM, subject
+to the tenancy's current Free Tier allowance. Select the current standard
+Ubuntu 24.04 LTS `aarch64` platform image for the Arm shape; OCI documents the
+standard Ubuntu image as supported on Arm. Use an owner-approved boot-volume
+size and keep Docker's data directory on that durable boot or attached block
+volume. Size CPU, memory, disk, and IOPS from observed pilot traffic.
 
 This is not an HA design. Keep deletion protection and a snapshot schedule under
-owner control; preserving a disk on VM deletion must be an explicit choice.
+owner control; preserving a boot volume on instance termination must be an
+explicit choice.
 
-## Firewall and network paths
+## Always Free and capacity caveats
 
-Allow inbound:
+Always Free eligibility is determined by the OCI Console and current Oracle
+terms, not by this repository. Eligible compute and block-volume resources must
+be created in the tenancy's home region. Ampere A1 capacity is not guaranteed;
+an `out of host capacity` response can require another availability domain or a
+later attempt. Do not select a paid shape, image, storage tier, backup schedule,
+or amount of capacity without owner approval and budget alarms.
+
+Oracle documents that idle Always Free instances may be reclaimed based on
+seven-day CPU, network, and (for A1) memory utilization. Free limits, backup
+allowances, and reclamation policy can change. Confirm the `Always Free-eligible`
+label and current limits immediately before provisioning. An Always Free VM is
+not an availability guarantee or a production SLA.
+
+## ARM64 image compatibility
+
+The exact repository pins were inspected on 2026-09-16 with
+`docker buildx imagetools inspect`. Each top-level digest is a multi-platform
+OCI index containing a Linux ARM64 manifest, so Docker can select the native
+Ampere A1 image without changing a pin:
+
+| Component | Pinned reference | ARM64 manifest |
+| --- | --- | --- |
+| PostgreSQL | `postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73` | `linux/arm64/v8` |
+| n8n | `n8nio/n8n:2.37.10@sha256:307d6065be25619aa24cfc63a7c2f04ca56d084a08c05c8e9f189a89f353b1ec` | `linux/arm64` |
+| Caddy | `caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d` | `linux/arm64/v8` |
+| FlowPilot Python base | `python:3.11.9-slim-bookworm@sha256:8fb099199b9f2d70342674bd9dbccd3ed03a258f26bbd1d556822c6dfc60c317` | `linux/arm64/v8` |
+
+Re-run those manifest inspections during a future pin update. Do not replace a
+multi-platform index digest with an architecture-specific child digest unless
+the deployment is intentionally restricted to that architecture.
+
+## OCI network and firewall paths
+
+Create or select a VCN with an internet gateway, public subnet, and route to the
+internet gateway. Attach a dedicated NSG to the VM VNIC when possible; a
+subnet security list is also supported but affects every VNIC in that subnet.
+Configure stateful ingress rules:
 
 - TCP `80` and `443` from the intended webhook/approval audience
-- TCP `22` only from an approved administrator CIDR, or use IAP TCP forwarding
-  from Google's documented `35.235.240.0/20` range
+- TCP `22` only from the approved administrator CIDR; OCI Bastion is an
+  alternative when the instance is designed without direct SSH exposure
 
-Do not create public rules for `5432`, `5678`, or `8000`.
+Do not create NSG, security-list, host-firewall, or public rules for `5432`,
+`5678`, or `8000`. Confirm the Ubuntu host firewall agrees with the OCI rules.
 
 ```text
 Internet --80/443--> Caddy
@@ -107,19 +151,12 @@ Set every required value without printing it to deployment logs:
 SMTP, HubSpot, and Google Sheets credentials stay in n8n's encrypted credential
 store. Do not duplicate them into `.env.prod`.
 
-For a GCE pilot, a root-owned `.env.prod` with mode `600` is the simplest
-supported runtime mechanism. Google Secret Manager is the recommended source of
-truth when available: grant only the VM service account Secret Accessor on the
-specific secret and materialize an environment file without echoing it, for
-example during an approved maintenance action:
-
-```bash
-umask 077
-gcloud secrets versions access latest --secret=flowpilot-prod-env > /opt/flowpilot/.env.prod
-```
-
-Creating that secret, assigning IAM, and selecting rotation policy are owner
-actions and are intentionally not automated here.
+For an OCI pilot, a root-owned `.env.prod` with mode `600` is the simplest
+supported runtime mechanism. OCI Vault may be used as the owner-controlled
+source of truth, but Vault, dynamic groups, IAM policies, retrieval, and
+rotation are deliberately not automated here. If Vault is used, grant the VM
+only the minimum secret-read permission and materialize `.env.prod` without
+printing values to shell history or deployment logs.
 
 For a temporary external-IP test, set `FLOWPILOT_CADDY_SITE` and
 `FLOWPILOT_PUBLIC_ORIGIN` to `http://EXTERNAL_IP` and set
@@ -128,10 +165,14 @@ credentials over HTTP. A trusted pilot requires DNS and HTTPS.
 
 ## Domain, DNS, and TLS
 
-Reserve a stable external IP, then create the owner-approved DNS `A`/`AAAA`
-record pointing at it. Set `FLOWPILOT_CADDY_SITE` to the domain with no scheme.
-Caddy obtains and renews a public certificate automatically after ports `80`
-and `443` reach the VM. Persistent Caddy volumes retain certificate state.
+Create an OCI **reserved public IPv4 address** and assign it to the primary
+private IP on the instance VNIC. Unlike an ephemeral public IP, a reserved IP
+can be unassigned and moved to a replacement instance. Point the owner-approved
+DNS `A` record at it; add `AAAA` only when IPv6 routing and security rules were
+explicitly configured. Set `FLOWPILOT_CADDY_SITE` to the domain with no scheme.
+Caddy obtains and renews a public certificate automatically after DNS resolves
+and ports `80` and `443` reach the VM. Persistent Caddy volumes retain
+certificate state.
 
 Do not hard-code a personal domain in the repository. If certificate issuance
 fails, inspect Caddy logs and DNS/firewall state; do not bypass browser TLS
@@ -166,8 +207,8 @@ trusted source to send it as `X-FlowPilot-Webhook-Secret` over HTTPS.
 
 ## n8n first-time setup
 
-The editor is not public. From an administrator workstation, create an SSH
-tunnel (or equivalent IAP tunnel) to VM loopback:
+The editor is not public. From an approved administrator workstation, create an
+SSH tunnel to VM loopback, using the restricted public SSH path or OCI Bastion:
 
 ```bash
 ssh -L 5678:127.0.0.1:5678 -L 8000:127.0.0.1:8000 ADMIN@VM_EXTERNAL_IP
@@ -218,8 +259,8 @@ drafts, idempotency keys, or provider payloads into tickets or chat.
 
 Use two layers:
 
-1. Scheduled GCE persistent-disk snapshots with an owner-approved retention and
-   cross-region policy.
+1. Scheduled OCI boot/block-volume backups with owner-approved retention,
+   region-copy policy, and a check against current Free Tier allowances.
 2. A regular PostgreSQL custom-format logical dump copied to an encrypted,
    access-controlled backup location outside the VM.
 
@@ -243,10 +284,10 @@ restored is not considered verified.
 ## Restore
 
 Restore into an isolated replacement VM first. Supply the original
-`N8N_ENCRYPTION_KEY`, restore the persistent-disk snapshot (or the n8n volume
-from a consistent backup), start PostgreSQL, and restore the logical database
-dump with `pg_restore`. Run the migration service afterward so a backup from an
-older revision advances through all committed migrations.
+`N8N_ENCRYPTION_KEY`, restore the OCI boot/block-volume backup (or the n8n
+volume from a consistent backup), start PostgreSQL, and restore the logical
+database dump with `pg_restore`. Run the migration service afterward so a
+backup from an older revision advances through all committed migrations.
 
 Do not restore over a live production volume. Database restore and volume
 replacement are destructive recovery operations requiring owner approval.
@@ -309,10 +350,12 @@ dashboard, React frontend, mobile application, HA platform, or cloud resources.
 
 ## Owner decisions required before provisioning
 
-- GCP project, billing budget/alerts, region/zone, VM class, and disk size
-- Domain, static IP, DNS, TLS contact, and permitted webhook sources
-- SSH versus IAP administration and allowed administrator CIDRs
-- Secret Manager/IAM ownership and rotation schedule
+- OCI tenancy, compartment, home region, availability domain, Ampere A1
+  capacity, shape allocation, boot-volume size, and budget alarms
+- VCN, subnet, NSG/security-list ownership, reserved public IP, domain, DNS,
+  TLS contact, and permitted webhook sources
+- Direct SSH versus OCI Bastion administration and allowed administrator CIDRs
+- OCI Vault/IAM ownership and rotation schedule, if Vault is used
 - Backup destination, snapshot frequency, retention, recovery objectives, and
   restore-test owner
 - SMTP, HubSpot, Google Sheets, and AI provider accounts/data-processing terms

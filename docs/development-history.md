@@ -26,7 +26,7 @@ that history while the main README presents the repository as one product.
 9. **Product packaging:** a Docker Compose stack, explicit ordered migrations,
    pinned dependency graphs, persistent service state, and reviewer-focused
    setup and demo documentation.
-10. **Production readiness:** a deliberately small GCE single-VM deployment
+10. **Production readiness:** a deliberately small OCI single-VM deployment
     model, Caddy TLS boundary, authenticated machine ingress, private service
     networking, secret handling, and documented backup/restore operations.
 
@@ -57,8 +57,8 @@ manual to avoid silently creating privileged external access.
 
 Phase 10A prepares that same stack for a bounded cloud pilot without creating
 cloud resources. Only the reverse proxy is public, trusted lead sources require
-a shared ingress secret, administration stays behind an SSH/IAP tunnel, and the
-single-VM durability and recovery limits are explicit.
+a shared ingress secret, administration stays behind an SSH or OCI Bastion
+tunnel, and the single-VM durability and recovery limits are explicit.
 
 ## Detailed records
 

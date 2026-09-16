@@ -1,6 +1,7 @@
 # Phase 10A deployment threat assessment
 
-This assessment covers the single-VM Google Compute Engine pilot deployment.
+This assessment covers the single-VM Oracle Cloud Infrastructure pilot
+deployment.
 It does not claim enterprise high availability or exactly-once distributed
 effects.
 

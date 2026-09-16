@@ -4,7 +4,7 @@
 
 ### Major development milestones
 
-- Added a GCP single-VM production deployment layer with Caddy-managed TLS,
+- Added an OCI single-VM production deployment layer with Caddy-managed TLS,
   loopback-only administration, private PostgreSQL networking, required trusted
   lead-ingress authentication, bounded n8n execution retention, and backup/
   restore guidance. No cloud resources are provisioned by the repository.
