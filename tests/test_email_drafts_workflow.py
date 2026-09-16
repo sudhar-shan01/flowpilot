@@ -2,6 +2,10 @@
 
 import json
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW_PATH = ROOT / "n8n" / "flowpilot-lead-workflow.json"
@@ -20,6 +24,52 @@ def nodes_by_name(workflow: dict[str, object]) -> dict[str, dict[str, object]]:
 
 def first_target(workflow: dict[str, object], source: str, output: int = 0) -> str:
     return workflow["connections"][source]["main"][output][0]["node"]
+
+
+def run_notification_sanitizer(result: dict[str, object]) -> dict[str, object]:
+    node = shutil.which("node")
+    assert node, "Install Node.js to run the n8n Code-node regression tests"
+    code = nodes_by_name(load_workflow())["Sanitize Email Result"]["parameters"][
+        "jsCode"
+    ]
+    prepared = {
+        "success": True,
+        "statusCode": 200,
+        "route": "high",
+        "message": "High-priority lead received.",
+        "analysis": {"priority": "high"},
+        "lead_id": 42,
+        "draft": {"subject": "Subject", "body": "Body"},
+        "approval": {"token": "not-public"},
+        "notification": {"recipient": "reviewer@example.com"},
+    }
+    program = r"""
+const fs = require('fs');
+const vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const lookup = (name) => ({item: {json: input.lookups[name]}});
+const output = vm.runInNewContext(
+  '(function(){' + input.code + '\n})()',
+  {$json: input.data, $: lookup},
+  {timeout: 1000},
+);
+process.stdout.write(JSON.stringify(output[0].json));
+"""
+    completed = subprocess.run(
+        [node, "-e", program],
+        input=json.dumps(
+            {
+                "code": code,
+                "data": result,
+                "lookups": {"Prepare Internal Notification": prepared},
+            }
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return json.loads(completed.stdout)
 
 
 def test_draft_migration_is_additive_and_requires_pending_approval() -> None:
@@ -124,6 +174,59 @@ def test_email_failure_is_sanitized_and_cannot_reach_success_route() -> None:
     assert first_target(workflow, "Route After Email Result", 1) == (
         "Prepare Idempotency Failure"
     )
+
+
+def test_internal_notification_requires_confirmed_recipient_acceptance() -> None:
+    code = nodes_by_name(load_workflow())["Sanitize Email Result"]["parameters"][
+        "jsCode"
+    ]
+
+    assert "Array.isArray(emailResult.accepted)" in code
+    assert "Array.isArray(emailResult.rejected)" in code
+    assert "accepted" in code
+    assert "rejected" in code
+    assert "outcome" in code
+    assert "uncertain" in code
+
+    sent = run_notification_sanitizer(
+        {"accepted": ["REVIEWER@example.com"], "rejected": []}
+    )
+    assert sent == {
+        "success": True,
+        "statusCode": 200,
+        "route": "high",
+        "message": "High-priority lead received.",
+        "analysis": {"priority": "high"},
+    }
+
+
+@pytest.mark.parametrize(
+    "smtp_result",
+    [
+        {},
+        {"success": True},
+        {"error": {"message": "sensitive provider detail"}},
+        {"accepted": [], "rejected": ["reviewer@example.com"]},
+        {
+            "accepted": ["reviewer@example.com"],
+            "rejected": ["reviewer@example.com"],
+        },
+    ],
+)
+def test_internal_notification_nonacceptance_is_sanitized(
+    smtp_result: dict[str, object],
+) -> None:
+    result = run_notification_sanitizer(smtp_result)
+
+    assert result == {
+        "success": False,
+        "statusCode": 503,
+        "error": {
+            "code": "EMAIL_ERROR",
+            "message": "Lead was processed but the internal notification could not be sent.",
+        },
+    }
+    assert "sensitive provider detail" not in json.dumps(result)
 
 
 def test_email_export_contains_reference_metadata_only_and_no_recipient() -> None:

@@ -133,6 +133,30 @@ def test_fingerprint_normalizes_all_business_fields_deterministically() -> None:
         assert forbidden not in field_names
 
 
+def test_unexpected_lead_fields_are_rejected_before_claim_or_business_work() -> None:
+    result = run_code(
+        "Prepare Idempotency Context",
+        envelope("strict-contract-key", unexpected_admin_flag=True),
+    )
+
+    assert result["idempotency_mode"] == "invalid"
+    assert result["statusCode"] == 422
+    assert result["error"] == {
+        "code": "VALIDATION_ERROR",
+        "message": "Lead payload failed validation.",
+    }
+    assert result["idempotency_key"] is None
+    assert first_target(WORKFLOW, "Route Idempotency Requirement", 2) == (
+        "Respond Idempotency Error"
+    )
+    assert "Atomically Claim Idempotency Key" not in reachable_from_output(
+        "Route Idempotency Requirement", 2
+    )
+    assert "Analyze Lead with FlowPilot" not in reachable_from_output(
+        "Route Idempotency Requirement", 2
+    )
+
+
 @pytest.mark.parametrize(
     "key",
     ["", " ", "\t", "x" * 129, "ok\r\nX-Injected: yes", "has space", "_starts-wrong"],

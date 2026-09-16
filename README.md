@@ -141,6 +141,7 @@ procedures and safe operator actions.
 - [Reliability incident runbook](docs/reliability-runbook.md)
 - [OCI single-VM pilot deployment](docs/oci-deployment.md)
 - [Deployment threat assessment](docs/deployment-threat-model.md)
+- [End-to-end certification and known limitations](docs/e2e-certification.md)
 - [Changelog](CHANGELOG.md)
 
 ## Production deployment readiness
@@ -441,6 +442,9 @@ flowpilot/
 ├── docs/
 │   ├── demo.md
 │   ├── development-history.md
+│   ├── deployment-threat-model.md
+│   ├── e2e-certification.md
+│   ├── oci-deployment.md
 │   └── reliability-runbook.md
 ├── .dockerignore
 ├── Dockerfile

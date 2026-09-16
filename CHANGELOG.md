@@ -4,6 +4,12 @@
 
 ### Major development milestones
 
+- Added the final synthetic end-to-end certification gate, including complete
+  PostgreSQL lifecycle, approval race, migration-lock, indexed-query, burst,
+  Docker restart/persistence, workflow import, and security evidence.
+- Hardened public lead validation so prohibited extra fields cannot be dropped
+  before FastAPI validation, and require confirmed recipient acceptance before
+  an internal approval notification is treated as successful.
 - Added an OCI single-VM production deployment layer with Caddy-managed TLS,
   loopback-only administration, private PostgreSQL networking, required trusted
   lead-ingress authentication, bounded n8n execution retention, and backup/
