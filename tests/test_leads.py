@@ -1,6 +1,7 @@
 """Lead endpoint validation and failure-path tests."""
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app.api.dependencies import get_ai_service
 from app.main import app
@@ -50,6 +51,74 @@ def test_rejects_missing_required_fields(client: TestClient) -> None:
     response = client.post("/lead/analyze", json={"name": "John Doe"})
 
     assert response.status_code == 422
+
+
+def test_rejects_malformed_json(client: TestClient) -> None:
+    response = client.post(
+        "/lead/analyze",
+        content=b'{"name":',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", ""),
+        ("name", "   "),
+        ("company", "\t"),
+        ("message", "         "),
+    ],
+)
+def test_rejects_blank_or_whitespace_only_text(
+    client: TestClient,
+    valid_lead: dict[str, object],
+    field: str,
+    value: str,
+) -> None:
+    valid_lead[field] = value
+
+    response = client.post("/lead/analyze", json=valid_lead)
+
+    assert response.status_code == 422
+
+
+def test_rejects_unexpected_fields(
+    client: TestClient,
+    valid_lead: dict[str, object],
+) -> None:
+    valid_lead["unexpected_admin_flag"] = True
+
+    response = client.post("/lead/analyze", json=valid_lead)
+
+    assert response.status_code == 422
+
+
+def test_rejects_oversized_lead_message(
+    client: TestClient,
+    valid_lead: dict[str, object],
+) -> None:
+    valid_lead["message"] = "x" * 5_001
+
+    response = client.post("/lead/analyze", json=valid_lead)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("method", ["get", "put", "patch", "delete"])
+def test_rejects_unsupported_analysis_methods(
+    client: TestClient,
+    method: str,
+) -> None:
+    response = getattr(client, method)("/lead/analyze")
+
+    assert response.status_code == 405
+
+
+def test_unknown_route_is_not_exposed(client: TestClient) -> None:
+    assert client.get("/not-a-flowpilot-route").status_code == 404
 
 
 class FailingProvider(AIProvider):
