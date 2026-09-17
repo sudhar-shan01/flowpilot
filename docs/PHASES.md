@@ -439,6 +439,7 @@ flowpilot/
 │   ├── integration/test_followup_postgres.py
 │   ├── integration/test_idempotency_postgres.py
 │   ├── integration/test_email_recovery_postgres.py
+│   ├── integration/test_chaos_recovery_postgres.py
 │   ├── integration/test_partial_work_reconciliation_postgres.py
 │   ├── integration/test_reliability_observability_postgres.py
 │   ├── test_lead_drafts.py
@@ -1492,6 +1493,7 @@ reliability integration tests together:
 ```powershell
 $env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8b1-test'
 python -m pytest tests/integration/test_followup_postgres.py tests/integration/test_idempotency_postgres.py tests/integration/test_email_recovery_postgres.py
+python -m pytest tests/integration/test_chaos_recovery_postgres.py
 Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
 ```
 
