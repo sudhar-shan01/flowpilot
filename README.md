@@ -167,7 +167,7 @@ backup retention before any live action.
 
 ## Reproducible development
 
-`requirements.txt` remains the readable direct dependency declaration.
+`requirements.txt` pins the certified direct runtime and test dependencies.
 `requirements.runtime.lock` pins the complete API runtime graph used by the
 Docker image, and `requirements.dev.lock` pins the runtime plus test tooling.
 The Python, PostgreSQL, and n8n image references retain readable version tags
@@ -183,12 +183,15 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-To update dependencies intentionally, create a clean Python 3.11 environment,
-install the bounded direct requirements from `requirements.txt`, inspect the
-resolved dependency graph with `python -m pip check`, then replace both lock
-files from `python -m pip freeze`. Remove packaging tools such as `pip` and
-`setuptools` from the locks, keep `pytest` and its dependencies only in the
-development lock, and run the full test and Docker build gates before commit.
+To update dependencies intentionally, use a dedicated reviewed change. Edit an
+exact version in `requirements.txt`, install it in a clean Python 3.11
+environment, and run `python -m pip check`. Regenerate `requirements.dev.lock`
+from that complete environment with `python -m pip freeze`. Regenerate
+`requirements.runtime.lock` in a second clean environment containing the same
+five runtime direct dependencies but not `pytest`. Remove packaging tools such
+as `pip` and `setuptools` from both locks, verify that the development lock is a
+strict superset of the runtime lock, and run the full test and Docker build
+gates before accepting the new versions. Never resolve to latest implicitly.
 
 ## Migrations and existing installations
 
