@@ -553,7 +553,11 @@ def test_concurrent_migration_runners_are_serialized_and_rerunnable():
         path.read_text(encoding="utf-8")
         for path in sorted((ROOT / "postgres" / "init").glob("*.sql"))
     )
-    lock_name = f"flowpilot-certification-{schema}"
+    run_migrations = (ROOT / "run-migrations.sql").read_text(encoding="utf-8")
+    assert "pg_advisory_lock(hashtextextended('flowpilot-schema-migrations', 0))" in run_migrations
+    assert "pg_advisory_unlock(hashtextextended('flowpilot-schema-migrations', 0))" in run_migrations
+
+    lock_name = "flowpilot-schema-migrations"
     script = (
         f'SET search_path TO "{schema}";\n'
         f"SELECT pg_advisory_lock(hashtextextended({literal(lock_name)},0));\n"
