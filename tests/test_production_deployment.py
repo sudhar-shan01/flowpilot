@@ -61,6 +61,31 @@ def test_caddy_publishes_only_exact_safe_routes() -> None:
     assert "/admin" not in CADDY
 
 
+def test_public_lead_route_requires_auth_and_strips_secret_before_n8n() -> None:
+    lead_block = CADDY.split("handle @lead {", maxsplit=1)[1].split(
+        "\n\n\t@approval", maxsplit=1
+    )[0]
+
+    assert "forward_auth flowpilot-api:8000" in lead_block
+    assert "uri /internal/ingress/verify" in lead_block
+    assert "reverse_proxy n8n:5678" in lead_block
+    assert lead_block.index("forward_auth") < lead_block.index("reverse_proxy")
+    assert "header_up -X-FlowPilot-Webhook-Secret" in lead_block
+
+
+def test_correct_secret_cannot_open_a_non_allowlisted_public_route() -> None:
+    public_paths = set(re.findall(r"^\s*@\w+ path (\S+)$", CADDY, re.MULTILINE))
+
+    assert public_paths == {
+        "/health",
+        "/webhook/flowpilot/lead",
+        "/webhook/flowpilot/approval",
+    }
+    for unavailable in ("/docs", "/openapi.json", "/admin/reconciliation-queue"):
+        assert unavailable not in public_paths
+    assert CADDY.rstrip().endswith('respond "Not found" 404\n\t}\n}')
+
+
 def test_n8n_production_privacy_and_retention_are_bounded() -> None:
     assert "EXECUTIONS_DATA_SAVE_ON_SUCCESS: none" in PROD
     assert "EXECUTIONS_DATA_SAVE_ON_ERROR: all" in PROD

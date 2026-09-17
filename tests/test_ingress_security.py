@@ -83,6 +83,33 @@ def test_configured_ingress_accepts_exact_secret(client: TestClient) -> None:
     assert response.content == b""
 
 
+@pytest.mark.parametrize("supplied", ["", " ", "malformed", "x" * 31])
+def test_configured_ingress_rejects_malformed_secret_values(
+    client: TestClient, supplied: str
+) -> None:
+    configure_secret("configured-production-secret-at-least-32-bytes")
+
+    response = client.get(
+        "/internal/ingress/verify",
+        headers={"X-FlowPilot-Webhook-Secret": supplied},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Webhook authentication failed."}
+
+
+def test_ingress_secret_comparison_is_case_sensitive(client: TestClient) -> None:
+    secret = "Case-Sensitive-Production-Secret-32-Bytes"
+    configure_secret(secret)
+
+    response = client.get(
+        "/internal/ingress/verify",
+        headers={"X-FlowPilot-Webhook-Secret": secret.lower()},
+    )
+
+    assert response.status_code == 401
+
+
 def test_ingress_uses_constant_time_digest_comparison(
     client: TestClient,
     monkeypatch,
