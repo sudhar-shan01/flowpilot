@@ -1,0 +1,1733 @@
+# FlowPilot phase and operations reference
+
+This document preserves the detailed implementation, configuration, manual
+verification, security, and reliability notes for Phases 1 through 10A. For a
+concise project entry point, see the [repository README](../README.md).
+
+Reliable AI-assisted lead automation with human approval, idempotency,
+partial-failure recovery, and operational reconciliation.
+
+FlowPilot combines a small FastAPI service, PostgreSQL 17, and n8n 2.37.10. It
+validates and analyzes inbound leads, records durable state, coordinates CRM and
+spreadsheet integrations, creates response drafts, requires explicit human
+approval before lead email, and quarantines work whose external outcome cannot
+be proved.
+
+## Why FlowPilot exists
+
+Real automation fails between steps. A database write can succeed before a CRM
+call fails. Two copies of the same request can arrive concurrently. An SMTP
+connection can disappear after the server accepted a message. A process can
+crash after an external side effect but before recording completion.
+
+FlowPilot makes those boundaries visible and recoverable. It uses atomic
+ownership claims, persisted workflow stages, human approval, conservative email
+delivery states, transactional audit events, and a privacy-safe reconciliation
+queue. It does not claim exactly-once distributed delivery; uncertain outcomes
+are held for investigation instead of being replayed blindly.
+
+## Quick start
+
+Docker is the only runtime prerequisite. Python, PostgreSQL, and n8n do not need
+to be installed on the host.
+
+```powershell
+git clone https://github.com/sudhar-shan01/flowpilot.git
+cd flowpilot
+Copy-Item .env.example .env
+# Set POSTGRES_PASSWORD and N8N_ENCRYPTION_KEY in .env.
+docker compose up --build
+```
+
+For bash or zsh, replace the copy command with `cp .env.example .env`. The
+example leaves secrets blank. Before starting Compose, set `POSTGRES_PASSWORD`
+and `N8N_ENCRYPTION_KEY` in `.env` to strong local values. Keep `.env` untracked.
+
+Once the containers are healthy:
+
+- API: <http://localhost:8000>
+- Swagger: <http://localhost:8000/docs>
+- Health: <http://localhost:8000/health>
+- n8n: <http://localhost:5678>
+
+The API health and documentation endpoints work without external credentials.
+AI analysis and drafts require `OPENAI_API_KEY`. HubSpot, Google Sheets, and
+SMTP remain disabled until their local n8n credentials are configured.
+
+On first n8n startup, create the local owner account, import the four JSON files
+from `n8n/`, and select credentials with these exact names where applicable:
+
+- `FlowPilot PostgreSQL`
+- `FlowPilot Google Sheets`
+- `FlowPilot HubSpot`
+- `FlowPilot Email`
+
+For the full-stack Compose quickstart, configure the `FlowPilot PostgreSQL`
+credential with the internal Docker service address:
+
+- Host: `postgres`
+- Port: `5432`
+- Database: `flowpilot` (or the local `POSTGRES_DB` value)
+- User: `flowpilot` (or the local `POSTGRES_USER` value)
+- Password: the local `POSTGRES_PASSWORD` value
+- SSL: disabled for local Compose
+
+Workflow import is intentionally manual. Compose mounts the exports read-only at
+`/opt/flowpilot-workflows` for inspection but never imports them on startup, so a
+restart cannot create duplicate workflows or credentials.
+
+Stop the stack without deleting data:
+
+```powershell
+docker compose down
+```
+
+Named volumes preserve PostgreSQL and n8n state. `docker compose down --volumes`
+deletes that local state and should only be used when a deliberate reset is
+required.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Lead[Lead] --> Intake[Webhook + idempotency]
+    Intake --> AI[AI analysis]
+    AI --> DB[(PostgreSQL)]
+    DB --> Sheets[Google Sheets]
+    DB --> HubSpot[HubSpot]
+    HubSpot --> Draft[Response draft]
+    Draft --> Approval[Human approval]
+    Approval --> Email[Email]
+    Email --> Followup[One scheduled follow-up]
+
+    Audit[Transactional audit events] --> Recovery[Recovery sweep]
+    Recovery --> Queue[Reconciliation queue]
+    DB -. state changes .-> Audit
+    Queue -. operator investigation .-> DB
+```
+
+The Compose startup path is deterministic:
+
+```text
+PostgreSQL healthy
+        ↓
+migrations 001 → 008 succeed
+        ↓
+FlowPilot API healthy
+        ↓
+n8n starts with http://flowpilot-api:8000 as its internal API URL
+```
+
+PostgreSQL is not published to the host in the full stack. Only API port `8000`
+and n8n port `5678` are published. The normal container path does not use
+`host.docker.internal`.
+
+## Reliability model
+
+- Optional idempotency keys are claimed atomically before business side effects.
+- A matching completed request replays only its allowlisted public response.
+- Durable stages distinguish safe retry from partial work requiring review.
+- Approval links are expiring and single use; GET remains side-effect-free.
+- Initial and follow-up email sends use atomic delivery claims.
+- Ambiguous SMTP outcomes become `uncertain` and are never resent automatically.
+- Database triggers record meaningful state transitions in the same transaction.
+- Recovery sweeps mutate only states whose safe transition is known.
+- Operational views exclude customer messages, drafts, tokens, credentials, and
+  plaintext idempotency keys.
+
+See [the reliability runbook](reliability-runbook.md) for investigation
+procedures and safe operator actions.
+
+## Demo and deeper documentation
+
+- [Five-minute product and reliability demo](demo.md)
+- [Development history and capability milestones](development-history.md)
+- [Reliability incident runbook](reliability-runbook.md)
+- [OCI single-VM pilot deployment](oci-deployment.md)
+- [Deployment threat assessment](deployment-threat-model.md)
+- [End-to-end certification and known limitations](e2e-certification.md)
+- [Changelog](CHANGELOG.md)
+
+## Production deployment readiness
+
+Phase 10A adds a reviewed production layer without changing the verified local
+quickstart. Use `compose.yml` plus `compose.prod.yml` on an Oracle Cloud
+Infrastructure pilot VM. Caddy is the only public container; it terminates TLS
+and routes only
+`/health`, the authenticated lead webhook, and the token-protected approval
+webhook. API documentation and the n8n editor remain on VM loopback for an SSH
+or OCI Bastion tunnel, and PostgreSQL has no public port.
+
+Trusted lead sources send a strong shared value in
+`X-FlowPilot-Webhook-Secret`. Caddy asks the internal API verifier to authorize
+the request, then removes that header before n8n receives it. Local deployments
+remain backward compatible when the secret is unset; the production Compose
+layer refuses to render without it.
+
+This repository does not provision OCI resources. Read
+[`docs/oci-deployment.md`](oci-deployment.md) and obtain owner decisions on
+tenancy, home region, Ampere A1 capacity, domain, budget, IAM, secrets, and
+backup retention before any live action.
+
+## Reproducible development
+
+`requirements.txt` pins the certified direct runtime and test dependencies.
+`requirements.runtime.lock` pins the complete API runtime graph used by the
+Docker image, and `requirements.dev.lock` pins the runtime plus test tooling.
+The Python, PostgreSQL, and n8n image references retain readable version tags
+and pin their manifest digests so a later registry update cannot silently change
+the verified images.
+
+Create a local Python 3.11 environment with the exact development set:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --no-deps -r requirements.dev.lock
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m pytest
+```
+
+To update dependencies intentionally, use a dedicated reviewed change. Edit an
+exact version in `requirements.txt`, install it in a clean Python 3.11
+environment, and run `python -m pip check`. Regenerate `requirements.dev.lock`
+from that complete environment with `python -m pip freeze`. Regenerate
+`requirements.runtime.lock` in a second clean environment containing the same
+five runtime direct dependencies but not `pytest`. Remove packaging tools such
+as `pip` and `setuptools` from both locks, verify that the development lock is a
+strict superset of the runtime lock, and run the full test and Docker build
+gates before accepting the new versions. Never resolve to latest implicitly.
+
+## Migrations and existing installations
+
+The one-shot `migrations` service runs `run-migrations.sql` with
+`ON_ERROR_STOP`. That file lists migrations `001` through `008` explicitly in
+numeric order. Every migration is rerunnable, so the same path supports a fresh
+database and an existing volume. A failed migration exits nonzero and prevents
+the API and n8n services from starting; Compose never recreates the database to
+hide a migration failure.
+
+Run the migration service again without restarting the stack:
+
+```powershell
+docker compose run --rm migrations
+```
+
+The legacy `compose.postgres.yml` remains available for database-only local
+development and the optional PostgreSQL integration suites. The root
+`compose.yml` is the supported reviewer quickstart.
+
+## Phase 9: Containerized deployment and reproducible packaging
+
+Phase 9 is complete. The Docker quick start, deterministic startup order,
+dependency locks, migration gate, persistent-volume behavior, and database-only
+compatibility path documented above are the Phase 9 operating contract.
+
+## Phase 10A: OCI pilot deployment readiness and ingress security
+
+Phase 10A is complete. The production deployment section above summarizes the
+single-VM Caddy edge, restricted public routes, loopback administration,
+internal-only PostgreSQL, and authenticated lead ingress. The full owner
+runbook and threat assessment remain in [oci-deployment.md](oci-deployment.md)
+and [deployment-threat-model.md](deployment-threat-model.md). No OCI resources
+have been provisioned by this repository.
+
+## Business problem
+
+Inbound leads often arrive as unstructured messages. Someone must read each request, identify what the prospect needs, estimate its quality and urgency, and decide what should happen next. That manual triage becomes slow and inconsistent as lead volume grows.
+
+FlowPilot turns a validated lead submission into a predictable, structured
+analysis. Phase 2 adds a real workflow entry point that routes the result by
+priority without duplicating AI logic outside the API. Phase 3A records each
+successfully validated lead and analysis in PostgreSQL. Phase 3B appends that
+same stored lead to Google Sheets. Phase 4 then synchronizes a HubSpot contact
+by email. Phase 5 generates and persists a plain-text response draft for human
+approval and sends the configured team recipient an internal notification
+before priority routing. Phase 6 adds expiring approve/reject links and sends
+the exact stored draft to the stored lead email only after a guarded approval.
+Phase 7 schedules one fixed follow-up 72 hours after a successful initial
+response. Phase 8A adds an explicit, atomic idempotency boundary before any
+lead-processing side effect. Phase 8B1 adds durable email delivery claims,
+conservative SMTP outcome classification, and a database-only recovery sweep
+that quarantines stale sends instead of retrying them. Phase 8B2 records a
+minimal durable workflow stage for keyed requests and reconciles stale work
+without replaying business side effects. Phase 8C adds transactionally consistent
+state-change events, sanitized recovery-run history, and read-only operational
+views without changing retry or business-processing behavior.
+
+## Current capabilities
+
+- `GET /health` for API availability checks
+- `POST /lead/analyze` for validated lead intake and structured AI analysis
+- `POST /lead/draft` for validated, plain-text lead response drafts
+- Category, priority, score, summary, and recommended next action
+- Provider-independent AI service boundary
+- OpenAI-compatible JSON Schema structured output
+- Controlled responses for missing credentials, timeouts, provider failures, and malformed model output
+- Automated, network-free endpoint and failure-path tests
+- Interactive API documentation at `/docs`
+- Importable n8n lead-intake workflow at `n8n/flowpilot-lead-workflow.json`
+- High, medium, and low priority routing with clean webhook responses
+- Sanitized n8n responses for validation, availability, and malformed-result errors
+- PostgreSQL persistence for validated lead analyses
+- Version-controlled database schema with range and enum-like constraints
+- Google Sheets persistence using the PostgreSQL-generated timestamp
+- Sanitized `PERSISTENCE_ERROR` webhook responses when either persistence step fails
+- HubSpot contact lookup with explicit create and update paths keyed by email
+- Sanitized `CRM_ERROR` responses when CRM synchronization fails
+- PostgreSQL draft persistence with `pending_approval` status
+- Internal SMTP notification through the `FlowPilot Email` n8n credential
+- Sanitized `DRAFT_ERROR` and `EMAIL_ERROR` partial-success responses
+- Cryptographically unpredictable, single-use approval tokens with a 48-hour lifetime
+- Atomic `pending_approval` to `approved` or `rejected` state transitions
+- Approved lead email sourced only from the persisted recipient, subject, and body
+- Browser-friendly approval results with sanitized failure responses
+- Optional Idempotency-Key protection at the n8n webhook boundary
+- Atomic PostgreSQL ownership for concurrent duplicate requests
+- Sanitized completed-response replay without repeating business side effects
+- Atomic ownership before initial-response and follow-up SMTP attempts
+- Durable `sending`, `sent`, `failed`, and `uncertain` email delivery states
+- Hourly PostgreSQL-only quarantine of delivery claims stale for 30 minutes
+- No automatic replay of uncertain email sends
+- Durable `claimed`, `business_started`, and `business_complete` stages for
+  keyed lead intake
+- Sanitized `RECONCILIATION_REQUIRED` duplicate response for partial work
+- PostgreSQL-only reconciliation of stale idempotency state after 60 minutes
+- Safe completion of stored public responses without rerunning business work
+- Append-oriented, transactionally consistent reliability events
+- Counter-only history for every hourly recovery sweep
+- Privacy-safe reconciliation queue with operator-friendly status labels
+- Read-only reliability summary for future operator tooling
+
+## Architecture
+
+```text
+HTTP request
+    │
+    ▼
+FastAPI route ── validates input with Pydantic
+    │
+    ▼
+AIService ── stable application interface and output validation
+    │
+    ▼
+AIProvider ── provider-specific request (OpenAI-compatible in Phase 1)
+```
+
+The route never calls an LLM SDK or endpoint directly. `AIService` accepts any implementation of `AIProvider`, which keeps provider replacement and test mocking small. Every provider response is treated as untrusted and revalidated as `LeadAnalysis` before it leaves the application.
+
+The health endpoint intentionally does not depend on AI credentials or provider availability.
+
+Phases 2 through 8C extend this architecture without changing the public webhook
+success contract:
+
+```text
+Webhook caller
+    │
+    ▼
+n8n Webhook → validate key + normalize payload
+             ├─ no key → existing behavior
+             └─ valid key → atomic PostgreSQL claim
+                              ├─ owner (`claimed`) → Prepare Lead → POST /lead/analyze
+                              ├─ completed duplicate → replay public response
+                              └─ processing/conflict/failed/recovery-required
+                                                           → sanitized 409
+                                                    │ valid only
+                                                    ▼
+                                      atomic `business_started` gate
+                                                    │ owner only
+                                                    ▼
+                                         PostgreSQL `leads`
+                                                    │ saved
+                                                    ▼
+                                           Google Sheets row
+                                                    │ appended
+                                                    ▼
+                                    HubSpot contact lookup/sync
+                                                    │ synchronized
+                                                    ▼
+                                      POST /lead/draft
+                                                    │ validated
+                                                    ▼
+                              Persist pending draft + approval token
+                                                    │ saved
+                                                    ▼
+                                Internal email with approve/reject links
+                                                    │ sent
+                                                    ▼
+                                      Priority switch (high/medium/low)
+                                                    │
+                                                    ▼
+                              store allowlisted response as `business_complete`
+                                                    │
+                                                    ▼
+                                  guarded final transition to `completed`
+                                                    │
+                                                    ▼
+                                          Clean webhook response
+
+Separate approval workflow:
+
+Human link → GET review page (format validation only; no side effects)
+                                           │ explicit human confirmation
+                                           ▼
+              POST decision → Validate ID/token/decision
+                                           → Atomic PostgreSQL transition
+                                           ├─ rejected → Browser confirmation
+                                           └─ approved → Atomic initial-email claim
+                                                        → Load stored draft/recipient
+                                                        → Plain-text lead email
+                                                        → Guarded delivery state update
+                                                        ├─ sent → timestamp + schedule follow-up
+                                                        ├─ failed → no follow-up
+                                                        └─ uncertain → quarantine, no retry
+
+Hourly recovery workflow:
+
+PostgreSQL Schedule Trigger → stale `sending` claims (30 minutes)
+                            → guarded transition to `uncertain`
+                            → no SMTP, AI, or external API call
+
+                            → stale idempotency work (60 minutes)
+                              ├─ `claimed` → `failed`
+                              ├─ `business_started` → `recovery_required`
+                              ├─ valid `business_complete` → `completed`
+                              └─ legacy/unsafe state → `recovery_required`
+                            → no business-side-effect replay
+                            → persist one counter-only recovery-run summary
+
+PostgreSQL observability (Phase 8C):
+
+State-changing transactions → database audit triggers
+                            → `flowpilot_reliability_events`
+                            → hashed request references / lead IDs only
+
+Operator read path → `flowpilot_reconciliation_queue`
+                   → `flowpilot_reliability_summary`
+                   → no customer content, tokens, drafts, or provider errors
+```
+
+## Project structure
+
+```text
+flowpilot/
+├── app/
+│   ├── api/
+│   │   ├── dependencies.py
+│   │   └── routes/
+│   │       ├── health.py
+│   │       └── leads.py
+│   ├── core/
+│   │   └── config.py
+│   ├── models/
+│   │   └── lead.py
+│   ├── services/
+│   │   └── ai_service.py
+│   └── main.py
+├── tests/
+│   ├── conftest.py
+│   ├── e2e_flowpilot_app.py
+│   ├── test_google_sheets_persistence.py
+│   ├── test_health.py
+│   ├── test_hubspot_crm.py
+│   ├── test_email_drafts_workflow.py
+│   ├── test_human_approval_workflow.py
+│   ├── test_followup_workflow.py
+│   ├── test_idempotency_workflow.py
+│   ├── test_email_recovery_workflow.py
+│   ├── test_partial_work_reconciliation_workflow.py
+│   ├── test_reliability_observability.py
+│   ├── integration/test_followup_postgres.py
+│   ├── integration/test_idempotency_postgres.py
+│   ├── integration/test_email_recovery_postgres.py
+│   ├── integration/test_partial_work_reconciliation_postgres.py
+│   ├── integration/test_reliability_observability_postgres.py
+│   ├── test_lead_drafts.py
+│   ├── test_leads.py
+│   ├── test_n8n_workflow.py
+│   ├── test_postgres_persistence.py
+│   └── test_docker_packaging.py
+├── n8n/
+│   ├── flowpilot-lead-workflow.json
+│   ├── flowpilot-approval-workflow.json
+│   ├── flowpilot-followup-workflow.json
+│   └── flowpilot-recovery-workflow.json
+├── postgres/
+│   └── init/
+│       ├── 001_create_leads.sql
+│       ├── 002_add_lead_drafts.sql
+│       ├── 003_add_human_approval.sql
+│       ├── 004_add_followups.sql
+│       ├── 005_add_idempotency.sql
+│       ├── 006_add_email_recovery.sql
+│       ├── 007_add_partial_work_reconciliation.sql
+│       └── 008_add_reliability_observability.sql
+├── docs/
+│   ├── demo.md
+│   ├── development-history.md
+│   ├── deployment-threat-model.md
+│   ├── e2e-certification.md
+│   ├── oci-deployment.md
+│   └── reliability-runbook.md
+├── .dockerignore
+├── Dockerfile
+├── compose.yml
+├── compose.postgres.yml
+├── run-migrations.sql
+├── requirements.runtime.lock
+├── requirements.dev.lock
+├── CHANGELOG.md
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+```
+
+## Installation
+
+Python 3.11 is the supported local development runtime.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --no-deps -r requirements.dev.lock
+.\.venv\Scripts\python.exe -m pip check
+```
+
+On macOS or Linux, activate the environment with `source .venv/bin/activate`.
+
+## Environment configuration
+
+Copy the example configuration and add your API key:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```dotenv
+FLOWPILOT_AI_PROVIDER=openai
+OPENAI_API_KEY=your-api-key
+FLOWPILOT_OPENAI_MODEL=gpt-4o-mini
+FLOWPILOT_OPENAI_BASE_URL=https://api.openai.com/v1
+FLOWPILOT_AI_TIMEOUT_SECONDS=20
+FLOWPILOT_LOG_LEVEL=INFO
+```
+
+`.env` is ignored by Git. Never commit a real key. The API can start and report healthy without a key, but `/lead/analyze` returns HTTP `503` until one is configured.
+
+## Run the API
+
+```powershell
+python -m uvicorn app.main:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` for Swagger UI.
+
+## Example request
+
+```bash
+curl -X POST http://127.0.0.1:8000/lead/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "John Doe",
+    "email": "john@example.com",
+    "company": "Acme Industries",
+    "message": "We need an automated inventory management solution for our 25-person company.",
+    "budget": 5000
+  }'
+```
+
+## Example response
+
+The exact analysis varies by model, but it always follows this schema:
+
+```json
+{
+  "category": "workflow automation",
+  "priority": "high",
+  "lead_score": 88,
+  "short_summary": "Acme needs inventory automation for a 25-person team.",
+  "recommended_action": "Schedule a discovery call to map inventory workflows."
+}
+```
+
+Expected service errors use generic messages and do not expose stack traces or provider response bodies. Lead names, email addresses, companies, and messages are not written to application logs.
+
+## Phase 2: n8n webhook integration
+
+Phase 2 adds an n8n workflow that accepts an incoming lead, maps only the five
+fields required by `LeadRequest`, calls the existing FlowPilot API, validates the
+structured result, and routes it through explicit high, medium, or low branches.
+The branches only prepare different webhook messages; persistence is handled by
+the Phase 3A and 3B nodes before routing.
+
+### Prerequisites
+
+- The Phase 1 API installed and configured as described above
+- n8n 2.x; the committed export is verified with n8n `2.37.10`
+- A valid `OPENAI_API_KEY` in FlowPilot's local `.env` for real AI analysis
+
+### Import the workflow
+
+1. Start n8n and open `http://localhost:5678`.
+2. Open **Workflows**, choose **Import from File**, and select
+   `n8n/flowpilot-lead-workflow.json`.
+3. Review the **Analyze Lead with FlowPilot** HTTP Request node.
+4. Configure the PostgreSQL, Google Sheets, and HubSpot nodes as described below.
+5. Save and activate the workflow to register its production webhook.
+
+The export is inactive by design so importing it cannot unexpectedly expose a
+webhook. It contains reference metadata for credentials named
+`FlowPilot PostgreSQL`, `FlowPilot Google Sheets`, and `FlowPilot HubSpot`, but
+no credential payload, token, password, database address, or spreadsheet ID.
+Create or select all three local credentials before activation as described
+below.
+
+### Start FlowPilot
+
+From the repository root, with the Python virtual environment active:
+
+```powershell
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Confirm `http://127.0.0.1:8000/health` returns `{"status":"healthy"}` before
+starting n8n.
+
+### Start and configure n8n
+
+If n8n runs directly on the same machine as FlowPilot:
+
+```powershell
+$env:FLOWPILOT_API_URL = "http://127.0.0.1:8000"
+$env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
+npx n8n@2.37.10 start
+```
+
+If n8n runs in Docker Desktop while FlowPilot runs on the host:
+
+```powershell
+docker run --rm -it --name flowpilot-n8n `
+  -p 5678:5678 `
+  -e FLOWPILOT_API_URL=http://host.docker.internal:8000 `
+  -e N8N_BLOCK_ENV_ACCESS_IN_NODE=false `
+  -v n8n_data:/home/node/.n8n `
+  docker.n8n.io/n8nio/n8n:2.37.10
+```
+
+`FLOWPILOT_API_URL` is the API base URL without `/lead/analyze`. When the
+variable is absent, the workflow uses
+`http://host.docker.internal:8000` as its Docker Desktop-friendly fallback.
+Current n8n releases block `$env` expressions by default, so the examples
+explicitly allow them. Keep secrets out of the n8n process environment when
+using this setting; this workflow only reads the non-secret API base URL.
+
+### Webhook URLs
+
+- Production, after activation:
+  `http://localhost:5678/webhook/flowpilot/lead`
+- Test, while **Listen for test event** is active in the editor:
+  `http://localhost:5678/webhook-test/flowpilot/lead`
+
+Example production request:
+
+```bash
+curl -X POST http://localhost:5678/webhook/flowpilot/lead \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "John Doe",
+    "email": "john@example.com",
+    "company": "Acme Industries",
+    "message": "We need inventory automation for our company.",
+    "budget": 5000
+  }'
+```
+
+A successful high-priority response has this shape:
+
+```json
+{
+  "success": true,
+  "route": "high",
+  "message": "High-priority lead received. Schedule a discovery call promptly.",
+  "analysis": {
+    "category": "workflow automation",
+    "priority": "high",
+    "lead_score": 88,
+    "short_summary": "Company needs inventory automation.",
+    "recommended_action": "Schedule a discovery call."
+  }
+}
+```
+
+The medium and low branches return the same structure with their matching
+`route` and branch message. Error responses intentionally omit internal details:
+
+- HTTP `422`, `VALIDATION_ERROR`: the incoming lead failed Phase 1 validation
+- HTTP `503`, `FLOWPILOT_UNAVAILABLE`: n8n could not reach the API
+- HTTP `503`, `FLOWPILOT_ERROR`: the API reported that analysis is unavailable
+- HTTP `502`, `INVALID_FLOWPILOT_RESPONSE`: the API returned an unexpected body
+
+### Troubleshooting networking
+
+- **n8n and FlowPilot both run on the host:** set
+  `FLOWPILOT_API_URL=http://127.0.0.1:8000`.
+- **n8n runs in Docker Desktop and FlowPilot runs on the host:** use
+  `http://host.docker.internal:8000`. `localhost` inside the n8n container points
+  back to that container, not to FlowPilot.
+- **Linux Docker Engine:** add an appropriate host-gateway mapping or set
+  `FLOWPILOT_API_URL` to an address the container can reach.
+- **FlowPilot returns `503`:** confirm `OPENAI_API_KEY` is present in FlowPilot's
+  `.env`, then restart the API.
+- **n8n blocks `$env` access:** set `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` and
+  restart n8n. On a hardened shared instance, leave the block enabled and set a
+  non-secret local URL directly in the HTTP Request node instead.
+
+## Phase 3A: PostgreSQL persistence
+
+Phase 3A extends the existing n8n workflow with a PostgreSQL insert. The
+original lead fields are carried across the FlowPilot HTTP request and combined
+with the validated analysis. Only the workflow's valid-analysis path reaches
+PostgreSQL; API and validation errors go directly to the existing clean error
+response. Priority routing occurs only after the insert succeeds.
+
+### Start local PostgreSQL
+
+Docker Desktop with Docker Compose is the recommended local setup. Add a strong
+local-only password to `.env`; the example deliberately leaves it blank:
+
+```dotenv
+POSTGRES_DB=flowpilot
+POSTGRES_USER=flowpilot
+POSTGRES_PASSWORD=replace-with-a-local-password
+POSTGRES_PORT=5432
+```
+
+Then start only the database service from the repository root:
+
+```powershell
+docker compose -f compose.postgres.yml up -d
+docker compose -f compose.postgres.yml ps
+```
+
+The first startup runs `postgres/init/001_create_leads.sql`. PostgreSQL stores
+`TIMESTAMPTZ` values as UTC instants, and the local container is explicitly set
+to UTC. The named Docker volume preserves data across ordinary container
+restarts. This legacy setup starts only PostgreSQL; run the API and n8n using the
+host or hybrid instructions below.
+
+If the named volume already existed before the schema file was added, init
+scripts will not run again. Apply the SQL file manually or recreate only this
+development database volume after backing up any data you need.
+
+### Configure the n8n PostgreSQL credential
+
+In n8n, create a **Postgres** credential named `FlowPilot PostgreSQL`, then
+select it in the **Persist Lead in PostgreSQL** node. Use the values from your
+local `.env`:
+
+- Database: `flowpilot` (or `POSTGRES_DB`)
+- User: `flowpilot` (or `POSTGRES_USER`)
+- Password: the local `POSTGRES_PASSWORD`
+- Port: `5432` (or `POSTGRES_PORT`)
+- SSL: disabled for this local-only database
+
+Choose the host for the topology you are running:
+
+- **Full-stack Compose:** the n8n container connects to the PostgreSQL service
+  on the shared Compose network. Use host `postgres` and port `5432`.
+- **Legacy/hybrid mode:** when n8n runs in Docker Desktop and PostgreSQL is
+  published on the host by `compose.postgres.yml`, use host
+  `host.docker.internal`.
+- **Host-native n8n:** when n8n runs directly on the host and PostgreSQL is
+  published by `compose.postgres.yml`, use host `127.0.0.1`.
+
+n8n encrypts credential values in its own credential store. Do not paste the
+password into the workflow node or commit it to this repository. After choosing
+the credential, save and activate the workflow.
+
+The PostgreSQL node uses `$1` through `$10` query placeholders and n8n's Query
+Parameters option. Lead values are never concatenated into SQL.
+
+### Database schema
+
+The `leads` table contains an identity `BIGINT` primary key, a defaulted
+`TIMESTAMPTZ` creation time, the five original lead fields, and all five
+analysis fields. PostgreSQL constraints permit only `high`, `medium`, or `low`
+priority and scores from 0 through 100. Budget uses `NUMERIC(14, 2)` and follows
+the API's accepted range.
+
+Inspect the schema and saved rows with:
+
+```powershell
+docker compose -f compose.postgres.yml exec postgres `
+  psql -U flowpilot -d flowpilot -c "\d leads"
+
+docker compose -f compose.postgres.yml exec postgres `
+  psql -U flowpilot -d flowpilot -c "SELECT id, created_at, email, priority, lead_score FROM leads ORDER BY id DESC;"
+```
+
+Submit the same webhook request documented in Phase 2. A successful response
+keeps the Phase 2 response contract unchanged. If PostgreSQL is unavailable or
+rejects the insert, the caller receives HTTP `503` with a sanitized body:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "PERSISTENCE_ERROR",
+    "message": "Lead was analyzed but could not be saved."
+  }
+}
+```
+
+SQL error text, database addresses, credentials, stack traces, and other
+internal details are not returned to the webhook caller.
+
+### Phase 3A verification
+
+Run the normal suite without a live database:
+
+```powershell
+python -m pytest
+```
+
+For a manual integration check, start PostgreSQL, FlowPilot, and n8n; configure
+the n8n Postgres credential; activate the workflow; send the Phase 2 curl
+request; and query the newest row as shown above. Stop PostgreSQL with:
+
+```powershell
+docker compose -f compose.postgres.yml down
+```
+
+## Phase 3B: Google Sheets persistence
+
+Phase 3B extends only the successful Phase 3A path. After PostgreSQL returns the
+stored row, n8n appends the same lead and analysis to Google Sheets, using
+PostgreSQL's `created_at` value. The existing priority switch and public webhook
+success response run only after both persistence steps succeed.
+
+```text
+Validated analysis
+      │
+      ▼
+PostgreSQL insert
+      │ success
+      ▼
+Google Sheets append
+      │ success
+      ▼
+Priority routing → unchanged webhook response
+```
+
+### Prepare the Google Sheet
+
+Create a spreadsheet and add these headers to row 1, from column A through K in
+exactly this order:
+
+```text
+created_at
+name
+email
+company
+message
+budget
+category
+priority
+lead_score
+short_summary
+recommended_action
+```
+
+Each line above represents one separate header cell. Header spelling and case
+must match because the n8n mappings use these names.
+
+### Configure Google Sheets in n8n
+
+1. Create an n8n **Google Sheets OAuth2 API** credential named
+   `FlowPilot Google Sheets` and complete Google's authorization flow in n8n.
+2. Open **Append Lead to Google Sheets** and select that local credential.
+3. In **Document**, select the spreadsheet from the list. To supply a
+   Spreadsheet ID directly, change the field to **By ID** and paste the ID from
+   the Google Sheets URL.
+4. In **Sheet**, enter the sheet/tab name. The committed workflow uses `Leads`
+   as the non-personal default; change it if your tab has another name.
+5. Confirm **Map Each Column Below** remains selected, then save and activate
+   the workflow.
+
+The node explicitly maps all eleven columns and does not construct rows through
+string concatenation. The workflow export contains only n8n credential-reference
+metadata. OAuth access tokens, refresh tokens, client secrets, service-account
+keys, spreadsheet IDs, and Google account details must stay in n8n or the local
+Google credential and must never be committed.
+
+### Success and partial-failure behavior
+
+On success, the caller still receives only `success`, `route`, `message`, and
+`analysis`; database IDs, timestamps, and spreadsheet details are not exposed.
+
+- If PostgreSQL fails, Google Sheets is bypassed and the existing sanitized
+  `PERSISTENCE_ERROR` is returned.
+- If PostgreSQL succeeds but Google Sheets fails, the PostgreSQL row remains and
+  the caller receives HTTP `503`, `PERSISTENCE_ERROR`, with the generic message
+  `Lead was analyzed but could not be fully persisted.`
+
+Phase 3B intentionally provides no distributed transaction or rollback between
+PostgreSQL and Google Sheets. It also adds no compensation, retries, or
+deduplication. Those reliability features remain scoped to Phase 8.
+
+### Manual verification
+
+Start PostgreSQL, FlowPilot, and n8n; configure both n8n credentials and the
+Google Sheets Document/Sheet fields; then activate the workflow and send the
+Phase 2 example webhook request. Verify that PostgreSQL contains the new row,
+the sheet contains a matching row with the same `created_at`, and the webhook
+response retains the documented Phase 2 shape.
+
+Automated tests require no Google account, credential, network access, or live
+spreadsheet. A live append test requires a user-authorized local Google Sheets
+credential.
+
+## Phase 4: HubSpot CRM contact synchronization
+
+Phase 4 adds a HubSpot Contact sync after both persistence steps succeed and
+before priority routing. It manages Contacts only: no HubSpot Company, Deal,
+pipeline, ticket, marketing, or email objects are created.
+
+```text
+PostgreSQL saved → Google Sheets appended → HubSpot contact search by email
+                                                   │
+                              existing contact ────┴──── missing contact
+                                      │                         │
+                                    update                    create
+                                      └───────────┬─────────────┘
+                                                  ▼
+                                          Priority routing
+```
+
+### Configure the HubSpot credential
+
+1. In n8n, create a **HubSpot OAuth2 API** credential named
+   `FlowPilot HubSpot`.
+2. Connect the intended HubSpot account and grant contact read/write access.
+3. Select that credential in **Search HubSpot Contact by Email**,
+   **Update HubSpot Contact**, and **Create HubSpot Contact**.
+4. Save and activate the workflow only after all three nodes show the local
+   credential as connected.
+
+The contact flow uses HubSpot's supported CRM v3 search, create, and update
+endpoints through n8n HTTP Request nodes with the predefined HubSpot credential.
+The built-in HubSpot contact node exposes a combined upsert rather than the
+explicit update/create paths required for this phase.
+
+### Lookup and field mapping
+
+The search uses the lead's validated `email` as an exact equality filter and
+requests at most one contact. A match supplies the HubSpot contact ID only to the
+internal update request; no match selects the create request. Repeated leads
+with the same email therefore update the existing Contact instead of creating a
+duplicate.
+
+FlowPilot maps only standard Contact properties:
+
+- `email` from the lead email
+- `firstname` from the first component of the trimmed lead name
+- `lastname` from the remaining name components, omitted when there are none
+- `company` from the lead company name
+
+No missing values are invented, no custom properties are created, and AI
+analysis fields remain in PostgreSQL and Google Sheets.
+
+### CRM failure and partial-success behavior
+
+The existing persistence failure behavior remains unchanged:
+
+- PostgreSQL failure bypasses both Google Sheets and HubSpot.
+- Google Sheets failure bypasses HubSpot.
+- A HubSpot search, create, update, authorization, or unexpected-response
+  failure returns HTTP `503` with this sanitized body:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "CRM_ERROR",
+    "message": "Lead was persisted but could not be synchronized with CRM."
+  }
+}
+```
+
+HubSpot response bodies, contact IDs, tokens, account details, API URLs, stack
+traces, and credential data are never included in webhook responses. If HubSpot
+fails, the PostgreSQL row and Google Sheets row remain; Phase 4 performs no
+rollback. Retries, compensation, recovery workflows, and broader deduplication
+remain scoped to Phase 8.
+
+On success, the webhook response still contains only `success`, `route`,
+`message`, and `analysis`. The HubSpot contact ID remains internal.
+
+### Manual verification
+
+Configure the existing PostgreSQL and Google Sheets steps, connect the local
+`FlowPilot HubSpot` credential, activate the workflow, and send the Phase 2
+example request. Confirm a HubSpot Contact is created with the mapped fields.
+Send the same email again with an updated name or company and confirm the same
+Contact is updated rather than duplicated, then verify the public webhook
+response retains its existing shape.
+
+Automated tests require no HubSpot account, credential, or network access. A
+live sync requires a user-authorized HubSpot credential and is optional when one
+is not already available locally. The workflow export contains only credential
+reference metadata; OAuth tokens, private-app tokens, client secrets, portal
+IDs, and other account data must remain in n8n and must never be committed.
+
+## Phase 5: Email notifications and AI-generated response drafts
+
+Phase 5 begins only after HubSpot synchronization succeeds. n8n sends the
+validated lead and analysis to `POST /lead/draft`, persists the returned draft,
+and sends an internal notification. The draft is never sent to the lead and is
+not included in the public webhook response.
+
+`POST /lead/draft` accepts this shape:
+
+```json
+{
+  "lead": {
+    "name": "John Doe",
+    "email": "john@example.com",
+    "company": "Acme Industries",
+    "message": "We need help automating our inventory workflow.",
+    "budget": 5000
+  },
+  "analysis": {
+    "category": "workflow automation",
+    "priority": "high",
+    "lead_score": 88,
+    "short_summary": "Acme needs inventory automation.",
+    "recommended_action": "Schedule a discovery call."
+  }
+}
+```
+
+It returns only `subject` and `body`. Both are revalidated after the provider
+call. Subjects must be a single line and no longer than 160 characters; bodies
+are limited to 2,000 characters. Empty values, extra fields, malformed output,
+and HTML-like content are rejected. The provider prompt forbids invented
+    pricing, discounts, timelines, promises, capabilities, recipients, names, and
+    signatures. Drafts remain plain text and require the Phase 6 human approval
+    workflow before delivery.
+
+### Draft persistence
+
+`postgres/init/002_add_lead_drafts.sql` upgrades existing `leads` tables by
+adding nullable `draft_subject`, `draft_body`, and `draft_status` columns. The
+workflow updates the row created earlier in the same execution using its
+internal database ID and parameterized SQL. A valid draft is stored with
+`draft_status = 'pending_approval'` before any email node runs. The migration is
+additive and uses `IF NOT EXISTS`, so existing lead rows remain valid.
+
+New PostgreSQL volumes apply both init files automatically. For an existing
+FlowPilot volume, apply the additive migration once without recreating it:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/002_add_lead_drafts.sql'
+```
+
+### Configure internal email
+
+1. Create an n8n SMTP credential named `FlowPilot Email` and select it in
+   **Send Internal Notification**.
+2. Set `FLOWPILOT_INTERNAL_EMAIL_TO` to the trusted team recipient in n8n's
+   local environment.
+3. Set `FLOWPILOT_INTERNAL_EMAIL_FROM` to the sender address allowed by the SMTP
+   account.
+4. Restart n8n after changing its environment, then activate the workflow.
+
+The recipient and sender are local configuration and must never be committed.
+The model cannot provide or override either address. The notification contains
+the lead summary, priority, score, recommended action, and pending draft. The
+email is plain text and is sent only to the configured internal recipient.
+
+### Failure and partial-success behavior
+
+The original failure order remains intact. PostgreSQL failure bypasses Sheets,
+CRM, drafting, and email. Sheets failure bypasses CRM, drafting, and email.
+HubSpot failure bypasses drafting and email. Draft generation, validation, or
+persistence failure returns HTTP `503` with sanitized `DRAFT_ERROR`. Missing or
+invalid recipient configuration and SMTP failures return HTTP `503` with
+sanitized `EMAIL_ERROR`.
+
+Earlier successful PostgreSQL, Google Sheets, and HubSpot work is not rolled
+back. No provider response, draft, recipient, SMTP detail, database ID, HubSpot
+ID, or credential detail is exposed by the error response. On complete success,
+the webhook still returns only `success`, `route`, `message`, and `analysis`.
+
+### Manual verification
+
+Apply the PostgreSQL migrations, start FlowPilot and n8n, configure the existing
+Phase 3 and Phase 4 credentials, add the local `FlowPilot Email` credential and
+the two email environment variables, then submit the documented webhook
+request. Confirm the matching `leads` row contains the draft with
+`pending_approval`, the internal mailbox receives one plain-text notification,
+and the lead receives no email. Live SMTP verification is optional when no
+credential is available; all automated tests remain network-free and
+credential-free.
+
+## Phase 6: Human approval workflow
+
+Phase 6 keeps draft generation and approval separate. The lead-intake workflow
+creates a PostgreSQL UUID token only after a valid draft has been stored as
+`pending_approval`. Its internal notification contains Approve and Reject links.
+The focused workflow at `n8n/flowpilot-approval-workflow.json` validates an
+emailed link and renders a confirmation page without changing state. Only the
+human's explicit POST confirmation can perform the PostgreSQL transition. A
+lead email is sent only on the successfully authorized approved path.
+
+### Database migration and states
+
+`postgres/init/003_add_human_approval.sql` additively creates nullable
+`approval_token`, `approval_expires_at`, `approval_decided_at`, and
+`initial_response_sent_at` columns. It also expands the draft-status constraint
+to permit only `pending_approval`, `approved`, or `rejected` (plus `NULL` for
+legacy leads), and creates a unique partial index for non-null tokens. The
+migration uses `IF NOT EXISTS` and preserves existing rows.
+
+New PostgreSQL volumes apply all migrations automatically. Apply the migration
+to an existing volume without recreating the database:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/003_add_human_approval.sql'
+```
+
+Allowed transitions are deliberately one-way:
+
+```text
+pending_approval → approved
+pending_approval → rejected
+```
+
+The GET review webhook performs only strict format validation and returns a
+minimal HTML form. It has no path to PostgreSQL, email, AI, or any other
+external side effect, so mail scanners, link previews, browser prefetching, and
+repeated GET requests cannot consume a token or decide a draft. The token is
+carried in a hidden form field and is not displayed on the confirmation page.
+
+Only the POST decision webhook is connected to the state-changing query. That
+query requires the same lead ID and token, a
+`pending_approval` status, an unexpired timestamp, and an exact `approve` or
+`reject` decision. It clears the token in the same atomic update. Approved and
+rejected rows cannot transition again, so a repeated or alternate-link click
+has no side effect. Links expire 48 hours after creation; no scheduler is
+required.
+
+### Configure and import approval
+
+1. Import both `n8n/flowpilot-lead-workflow.json` and
+   `n8n/flowpilot-approval-workflow.json` into n8n `2.37.10`.
+2. Reselect the local `FlowPilot PostgreSQL` credential on every PostgreSQL
+   node in both workflows. Exported credential IDs are references, not secrets,
+   and differ between n8n instances.
+3. Reselect the local `FlowPilot Email` SMTP credential on **Send Internal
+   Notification** and **Send Persisted Draft to Lead**.
+4. Set `FLOWPILOT_APPROVAL_URL` in the n8n environment to the approval
+   workflow's production webhook URL, for example
+   `https://n8n.example.com/webhook/flowpilot/approval`. Do not include query
+   parameters, credentials, or a fragment.
+5. Set `FLOWPILOT_LEAD_EMAIL_FROM` to a sender address allowed by the SMTP
+   account. Keep the existing internal recipient/sender variables configured.
+6. Restart n8n after changing its environment, then activate both workflows.
+
+The internal notification links send only `lead_id`, `token`, and `decision` to
+the GET review webhook. The resulting page requires an explicit human POST of
+those same three fields. Both boundaries reject missing, blank, malformed,
+extra, or unsupported fields. The POST never accepts a recipient, subject,
+body, company, or AI content.
+On approval, PostgreSQL supplies the recipient and the exact stored
+`draft_subject` and `draft_body`; the workflow neither calls AI nor regenerates
+or edits the draft. Sender addresses are validated before either email node.
+
+### Approval results and failures
+
+- **Approved:** atomically set `approved` and clear the approval token, then
+  atomically claim the initial email. Only that claim owner may send the
+  persisted plain-text draft to the persisted lead email. A confirmed SMTP
+  acceptance records `initial_response_sent_at` and schedules the follow-up.
+- **Rejected:** atomically set `rejected`, set `approval_decided_at`, clear the
+  token, retain the draft for audit, send no lead email, and show a rejection
+  confirmation.
+- **Invalid, expired, mismatched, legacy, or used link:** change nothing, send
+  nothing, and return the same generic browser response without confirming
+  whether a lead exists.
+- **Approval/database/setup failure:** return a sanitized `APPROVAL_ERROR`
+  internally and a generic browser response. SQL errors, hosts, IDs, tokens,
+  credentials, lead data, and provider responses are not exposed.
+- **SMTP result after approval:** a proven pre-SMTP validation failure or
+  explicit recipient rejection becomes `failed`. Confirmed acceptance becomes
+  `sent`. A timeout, connection loss, malformed result, missing result, or any
+  outcome where acceptance cannot be proved becomes `uncertain`. All keep the
+  approval transition intact and leave the single-use token invalidated.
+
+If SMTP accepts the message but the database cannot record that result, the row
+remains `sending`. The recovery workflow later quarantines a stale claim as
+`uncertain`; it never resends it. SMTP acceptance is not proof of inbox delivery,
+and the database and mail server cannot participate in one atomic transaction.
+
+### Local manual demo
+
+Apply migration `003`, configure the two local credentials and four email/link
+environment variables, and activate both workflows. Submit the documented lead
+webhook request, then confirm the row has a non-null token, a 48-hour expiry,
+and `pending_approval`. Open one internal-email link and confirm the review page
+alone leaves the row and token unchanged. Then press its confirmation button:
+
+- Approve: confirm one lead email exactly matches the persisted subject/body,
+  the status is `approved`, the token is null, and the sent timestamp is set.
+- Reject: confirm the status is `rejected`, the token is null, the draft remains,
+  and the lead receives no email.
+
+Repeatedly open either emailed GET link before confirming and verify the row
+remains `pending_approval`. After one POST decision, open either link again and
+confirm that no second decision or email is possible. Live SMTP verification is
+optional when no local credential is available; the automated suite is
+network-free and credential-free.
+
+## Phase 7: Automated follow-ups
+
+Exactly one deterministic follow-up is scheduled 72 hours after the successful
+initial response is recorded. The due timestamp is exact; delivery occurs on
+the next hourly run, subject to the 20-row batch limit and service availability.
+
+```text
+Confirmed initial SMTP acceptance → guarded timestamp + follow-up scheduling
+Hourly Schedule Trigger → atomic claim of up to 20 due rows
+→ validate persisted recipient/configured sender → plain-text SMTP
+→ mark same claim sent or failed
+```
+
+Migration `postgres/init/004_add_followups.sql` adds nullable `followup_status`,
+`followup_due_at`, `followup_claimed_at`, and `followup_sent_at`. It runs in a
+transaction, preserves rows, supports reruns, and indexes scheduled due work.
+Migration `006` expands the database constraint to permit `scheduled`,
+`sending`, `sent`, `failed`, `cancelled`, `uncertain`, or NULL. Legacy rows
+remain NULL; there is no automatic backfill.
+
+The approval workflow records `initial_response_sent_at` and schedules the
+follow-up in one guarded update, reached only after confirmed initial SMTP
+acceptance by the current claim owner. PostgreSQL's
+transaction-stable `NOW()` makes the due time exactly 72 hours later. Existing
+follow-up states, including cancellation, are preserved. Initial SMTP failure
+or uncertainty never reaches this update. If SMTP succeeds but this update
+fails, the delivery remains `sending` for conservative recovery.
+
+The claim uses one `WITH ... UPDATE ... RETURNING` statement with
+`FOR UPDATE SKIP LOCKED`, ordered by due time and ID, limited to 20 rows.
+Only scheduled, due, approved leads with a recorded initial send and a valid
+persisted mailbox can transition to `sending`. A second concurrent transaction
+skips locked rows. Subsequent runs exclude sending, sent, failed, cancelled,
+future, pending, rejected, unsent, and legacy rows. Result updates require both
+the same lead ID and claim timestamp, with status still `sending`.
+
+The email uses the fixed subject `Following up on our previous message` and a
+short plain-text greeting inviting a reply. No AI, customer-supplied headers,
+pricing, deadlines, or new claims are used. The recipient comes only from the
+claimed PostgreSQL row and is validated again before SMTP. Phase 7 deliberately
+accepts single ASCII mailbox addresses, not display-name lists or international
+mailboxes. The sender comes from `FLOWPILOT_LEAD_EMAIL_FROM`; SMTP uses the local
+`FlowPilot Email` credential. No sender address or credential payload is exported.
+
+Confirmed SMTP acceptance records `sent` and `followup_sent_at`. A proven
+pre-SMTP validation failure or explicit recipient rejection records `failed`.
+Missing, malformed, timeout, connection-loss, and otherwise ambiguous SMTP
+results record `uncertain`, leaving the initial response and approval state
+unchanged. Errors are sanitized to `FOLLOWUP_ERROR`,
+`FOLLOWUP_EMAIL_ERROR`, or `FOLLOWUP_STATE_ERROR` as appropriate. Raw node errors
+may still exist in restricted n8n execution logs; they are not forwarded in
+result messages. No automatic retry is configured.
+
+A crash or a result-update failure can leave a row `sending`, including when
+SMTP may already have accepted the message. Phase 8B1 quarantines stale claims
+as `uncertain` after 30 minutes and never resets or replays them automatically.
+SMTP acceptance does not prove inbox delivery, and database/SMTP cannot provide
+an atomic exactly-once transaction. Manual n8n retries or state resets can
+duplicate mail.
+
+There is no inbound reply detection. An operator can suppress a scheduled
+follow-up before it is claimed using a parameterized query:
+
+```sql
+UPDATE leads SET followup_status = 'cancelled'
+WHERE id = $1 AND followup_status = 'scheduled';
+```
+
+Check that one row was updated. A zero-row result may mean the scheduler already
+claimed it; cancelling cannot recall an in-flight email. No dashboard or inbound
+mail integration is included.
+
+### Configure and verify Phase 7
+
+1. Apply all migrations to a new local database, or apply `004` to the existing
+   database before activating the updated approval workflow:
+
+   ```powershell
+   docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/004_add_followups.sql'
+   ```
+
+2. Import all three JSON files from `n8n/` into n8n `2.37.10`. Reselect your
+   local `FlowPilot PostgreSQL` credential on every PostgreSQL node and
+   `FlowPilot Email` on email nodes. Set `FLOWPILOT_LEAD_EMAIL_FROM` in n8n's
+   environment, then activate the workflows. The scheduler uses UTC hourly runs.
+3. With a controlled test recipient, approve and send an initial response.
+   Verify `scheduled` and a due time exactly 72 hours after the sent timestamp.
+   Rejection, pending approval, and initial SMTP failure must not schedule work.
+4. In an isolated test database, seed due/future/cancelled examples and execute
+   the scheduler. Verify only due eligible rows send, no more than 20 are claimed,
+   and running again cannot reclaim sending/sent/failed/cancelled rows. Do not
+   manipulate production timestamps to accelerate a demo.
+5. Simulate SMTP failure with mocks: the row becomes failed, never automatically
+   scheduled again. A stopped execution after claiming remains sending.
+
+Automated Code-node tests execute the committed JavaScript with Node.js; they
+use no network, SMTP credentials, or sleeps. Install Node.js in addition to the
+Python dependencies. Optional PostgreSQL execution tests run the exact committed
+SQL, including two overlapping claim transactions, migration reruns, status
+constraints, and the 72-hour boundary, against a disposable container:
+
+```powershell
+docker run -d --name flowpilot-phase7-test --network none -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17-alpine
+# Wait for pg_isready to report accepting connections before running tests.
+docker exec flowpilot-phase7-test pg_isready -U postgres
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase7-test'
+python -m pytest tests/integration/test_followup_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+docker rm -f -v flowpilot-phase7-test
+```
+
+Use only a disposable test container: these tests create and remove their own
+isolated schemas. No ports are published and the container has no network.
+The normal suite skips these optional database tests when the variable is unset.
+
+## Phase 8A: Idempotency and duplicate protection
+
+Clients can opt into strong duplicate protection by sending an
+`Idempotency-Key` header with `POST /webhook/flowpilot/lead`. The key
+identifies one delivery attempt; it does not identify a person or company.
+FlowPilot never deduplicates globally by email, and the same email submitted
+under two different keys remains two independent leads.
+
+Use a stable key generated by the caller for the logical request:
+
+```powershell
+curl.exe -X POST http://localhost:5678/webhook/flowpilot/lead `
+  -H "Content-Type: application/json" `
+  -H "Idempotency-Key: lead-import-2026-09-10-0001" `
+  -d '{"name":"John Doe","email":"john@example.com","company":"Acme Industries","message":"We need inventory automation for our company.","budget":5000}'
+```
+
+Keys must be 1–128 characters, begin with an ASCII letter or digit, and contain
+only ASCII letters, digits, `.`, `_`, `~`, `:`, `/`, `+`, `=`,
+or `-`. Blank, whitespace-only, overlong, control-character, CR/LF, and other
+malformed values receive HTTP `400` with `INVALID_IDEMPOTENCY_KEY`. The key
+is not copied to leads, Sheets, HubSpot, drafts, emails, or public responses.
+
+The workflow trims the four text fields, normalizes a numeric budget, and builds
+a fixed-order representation of `name`, `email`, `company`, `message`,
+and `budget`. PostgreSQL hashes that representation with SHA-256. Timestamps,
+generated tokens, credentials, and workflow metadata are excluded.
+
+Migration `postgres/init/005_add_idempotency.sql` creates the dedicated
+`flowpilot_idempotency` table. It is additive, transactional, safe to rerun,
+and does not alter existing leads. The primary key is the full idempotency key;
+each row stores the SHA-256 fingerprint, `processing`/`completed`/`failed`
+state, an internal claim token, lifecycle timestamps, and only the sanitized
+public JSON response needed for completed replay.
+
+The first request atomically inserts ownership before AI analysis, PostgreSQL
+lead insertion, Sheets append, HubSpot synchronization, draft generation,
+approval-token creation, notification email, or priority routing. The
+`INSERT ... ON CONFLICT ... RETURNING` statement compares an unpredictable
+claim token, so exactly one concurrent execution owns a new key:
+
+- Same key and fingerprint while `processing`: HTTP `409`,
+  `REQUEST_IN_PROGRESS`; there is no waiting or polling.
+- Same key and fingerprint after `completed`: HTTP `200` with the saved
+  public success contract. No business node runs again.
+- Same key with a different fingerprint: HTTP `409`,
+  `IDEMPOTENCY_CONFLICT`; neither payload is exposed or changed.
+- Same key after `failed`: HTTP `409`, `REQUEST_FAILED`; FlowPilot does
+  not blindly retry possibly partial work.
+- No key: the Phase 1–7 behavior remains available, but strong duplicate
+  protection is not provided.
+
+Only the owner can mark its row completed or failed because final updates
+require the same key, fingerprint, internal claim token, and `processing`
+state. Completed storage includes only `success`, `route`, `message`, and
+the five public analysis fields. Replay reconstructs that allowlisted shape,
+excluding lead IDs, approval tokens, drafts, provider data, credentials, and
+notification content.
+
+If an execution stops after claiming, or a terminal state update fails, the row
+may remain `processing`. If work fails after some external side effects, it
+is marked `failed`. Neither state can automatically run again in Phase 8A.
+Stale claim recovery, partial-work reconciliation, retry policy, stuck
+`sending` recovery, and uncertain SMTP outcomes remain Phase 8B work.
+
+Apply the migration to an existing database before activating the updated lead
+workflow:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/005_add_idempotency.sql'
+```
+
+Import the three workflow JSON files into n8n `2.37.10` and reselect the local
+`FlowPilot PostgreSQL` credential on the new idempotency nodes. The approval
+and follow-up workflow behavior is unchanged.
+
+The default suite is network-free and skips optional database execution tests.
+For the real atomic-claim checks, use only a disposable PostgreSQL 17 container:
+
+```powershell
+docker run -d --name flowpilot-phase8a-test --network none -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17-alpine
+# Wait for pg_isready to report accepting connections.
+docker exec flowpilot-phase8a-test pg_isready -U postgres
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8a-test'
+python -m pytest tests/integration/test_idempotency_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+docker rm -f -v flowpilot-phase8a-test
+```
+
+The integration tests execute the committed PostgreSQL 17 migration and
+workflow SQL. They verify concurrent same-key ownership, independent
+different-key claims, completed replay, fingerprint conflicts, failed-state
+suppression, the unique constraint, and repeatable migration without sleeps or
+credentials.
+
+## Phase 8B1: Email recovery and uncertain-send reconciliation
+
+Phase 8B1 makes initial-response and follow-up email attempts durable without
+pretending that PostgreSQL and SMTP can provide an exactly-once transaction.
+Before either SMTP node can run, one PostgreSQL statement atomically changes an
+eligible row to `sending` and records claim identity. Only the execution that
+owns that claim may send or record its outcome.
+
+Migration `postgres/init/006_add_email_recovery.sql` is additive,
+transactional, rerunnable, and preserves legacy rows. It adds
+`initial_response_delivery_status`, `initial_response_claim_token`, and
+`initial_response_claimed_at`, and extends the follow-up constraint with
+`uncertain`. Initial delivery status is nullable for legacy/not-attempted rows
+and otherwise permits `sending`, `sent`, `failed`, or `uncertain`. Follow-up
+status permits `scheduled`, `sending`, `sent`, `failed`, `cancelled`,
+`uncertain`, or NULL.
+
+Delivery state meanings:
+
+- `sending`: one execution owns the attempt; acceptance is not yet durably
+  known.
+- `sent`: SMTP explicitly reported acceptance and the owning claim recorded it.
+- `failed`: failure was proved before SMTP, or SMTP explicitly rejected the
+  recipient without accepting it.
+- `uncertain`: delivery may or may not have been accepted. It is quarantined
+  and is never retried automatically.
+- `scheduled`/`cancelled`: follow-up-only states for future eligible work or an
+  operator-suppressed follow-up.
+
+Initial delivery uses only the recipient, subject, and body returned by the
+atomic PostgreSQL claim plus the configured `FLOWPILOT_LEAD_EMAIL_FROM` sender.
+It does not accept message content from the approval POST and does not call AI.
+Confirmed acceptance records `sent`, sets `initial_response_sent_at`, and
+schedules exactly one follow-up for `NOW() + INTERVAL '72 hours'` in the same
+guarded update. Failure and uncertainty do not schedule a follow-up.
+
+The Phase 7 follow-up claim remains the existing atomic
+`FOR UPDATE SKIP LOCKED` transition from due `scheduled` work to `sending`.
+Result updates still require the claimed row and claim timestamp. Confirmed
+acceptance becomes `sent`, an explicit rejection becomes `failed`, and an
+ambiguous outcome becomes `uncertain`. Rows in `sending`, `sent`, `failed`,
+`cancelled`, `uncertain`, or any ineligible lead state cannot be claimed.
+
+The separate `n8n/flowpilot-recovery-workflow.json` runs hourly and performs
+PostgreSQL updates only. Initial-response and follow-up claims that have stayed
+`sending` for at least 30 minutes are changed to `uncertain` with guarded
+conditions. Fresh claims are untouched. The workflow has no SMTP, AI, HTTP, or
+other external integration and therefore cannot send or retry email.
+
+### Configure and verify Phase 8B1
+
+Apply migration `006` to an existing database before activating the updated
+approval, follow-up, or recovery workflows:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/006_add_email_recovery.sql'
+```
+
+Import all four workflow JSON files from `n8n/` into n8n `2.37.10`. Reselect
+the local `FlowPilot PostgreSQL` credential on all PostgreSQL nodes and the
+local `FlowPilot Email` credential on both SMTP workflows. Ensure
+`FLOWPILOT_LEAD_EMAIL_FROM` is available to n8n, then activate the approval,
+follow-up, and recovery workflows. The recovery schedule is hourly in UTC and
+uses a fixed 30-minute stale threshold.
+
+For a read-only investigation, inspect delivery state, claim age, and n8n
+execution history before taking any manual action:
+
+```sql
+SELECT id,
+       initial_response_delivery_status,
+       initial_response_claimed_at,
+       followup_status,
+       followup_claimed_at
+FROM leads
+WHERE initial_response_delivery_status IN ('sending', 'uncertain')
+   OR followup_status IN ('sending', 'uncertain')
+ORDER BY COALESCE(initial_response_claimed_at, followup_claimed_at), id;
+```
+
+Do not manually reset an uncertain row to a sendable state: the mail server may
+already have accepted that message. Phase 8B1 intentionally provides no
+automatic retry, requeue, inbox-delivery proof, or operator resolution action.
+Phase 8B2 adds separate idempotency-stage reconciliation but deliberately does
+not change or resend these uncertain email states.
+
+The optional PostgreSQL tests execute migrations `001` through `006` and the
+exact workflow SQL against one disposable PostgreSQL 17 container. Run all
+reliability integration tests together:
+
+```powershell
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8b1-test'
+python -m pytest tests/integration/test_followup_postgres.py tests/integration/test_idempotency_postgres.py tests/integration/test_email_recovery_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+```
+
+These tests cover migration reruns and constraints, concurrent initial-email
+ownership, the 72-hour scheduling boundary, guarded terminal updates, stale and
+fresh recovery boundaries, and the rule that uncertain work cannot be claimed.
+
+## Phase 8B2: Stale idempotency and partial-work reconciliation
+
+Phase 8B2 prevents a keyed request that stopped mid-work from remaining
+ambiguous forever, while keeping the core safety rule: uncertain business work
+is never replayed automatically. Migration
+`postgres/init/007_add_partial_work_reconciliation.sql` additively extends
+`flowpilot_idempotency` with nullable `workflow_stage` and `stage_updated_at`
+columns, widens the status field for `recovery_required`, and adds explicit
+status, stage, timestamp, and state-consistency constraints. Historical rows
+retain a NULL stage and are not reinterpreted during migration.
+
+New keyed requests use only three durable stages:
+
+- `claimed`: the key and fingerprint have one owner, but no irreversible
+  business side effect has been allowed to start. AI analysis may occur here.
+- `business_started`: the original owner atomically crossed the safety boundary
+  immediately before `Persist Lead in PostgreSQL`. PostgreSQL lead insertion,
+  Sheets, HubSpot, draft/token persistence, and notification email may now have
+  occurred, so replaying the complete workflow is unsafe.
+- `business_complete`: every normal lead-intake side effect succeeded and the
+  exact allowlisted public response is stored, while status deliberately remains
+  `processing` until a separate owner-guarded final update sets `completed`.
+
+The `claimed → business_started` transition requires the idempotency key,
+request fingerprint, original unpredictable claim token, `processing` status,
+and current `claimed` stage in one UPDATE. A keyed request cannot reach the
+first leads INSERT unless that transition succeeds. Unkeyed requests keep their
+existing path. A known failure while still `claimed` becomes `failed`; a known
+failure after `business_started` becomes `recovery_required`.
+
+`recovery_required` means FlowPilot cannot safely infer which durable or
+external side effects happened. A same-payload duplicate receives HTTP 409 with
+`RECONCILIATION_REQUIRED`; a different fingerprint still receives
+`IDEMPOTENCY_CONFLICT`. Neither outcome can reach AI, lead persistence, Sheets,
+HubSpot, draft/token creation, or email. The normal workflow never resets this
+state, generates a replacement claim token, or suggests using a new key.
+
+After success routing, the workflow stores only `success`, `route`, `message`,
+and the five public analysis fields at `business_complete`. SQL verifies the
+exact top-level and analysis key sets, value types, priorities, and score range.
+The separate final update requires the same key, fingerprint, claim token,
+`processing` status, `business_complete` stage, and valid stored response. If
+that final write fails, no business node runs again; the durable
+`business_complete` state remains safe for later database-only finalization.
+
+The existing hourly `n8n/flowpilot-recovery-workflow.json` remains PostgreSQL
+only. Its 30-minute Phase 8B1 email quarantine is unchanged. It additionally
+reconciles idempotency rows that have been stale for at least 60 minutes:
+
+- stale `claimed` → `failed`, because the durable business boundary was never
+  crossed;
+- stale `business_started` → `recovery_required`;
+- stale `business_complete` with a strictly valid stored public response →
+  `completed`, setting `completed_at` without invoking any business node;
+- stale `business_complete` with malformed or extra data →
+  `recovery_required`, never replayed;
+- stale legacy `processing` with a NULL stage → `recovery_required`.
+
+Fresh work, including a claim aged 59 minutes 59 seconds, remains unchanged;
+the exact 60-minute boundary is stale. Existing `completed`, `failed`, and
+`recovery_required` rows are untouched. The recovery workflow contains no HTTP,
+SMTP, AI, Google Sheets, or HubSpot node and never retries partial work. Phase
+8B1 `uncertain` email states remain quarantined and are not reset or resent.
+
+### Configure and verify Phase 8B2
+
+Apply migration `007` to an existing database before activating the updated
+lead-intake and recovery workflows:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/007_add_partial_work_reconciliation.sql'
+```
+
+Import the same four workflow JSON files into n8n `2.37.10`, reselect the local
+`FlowPilot PostgreSQL` credential on the added lead-intake nodes and the updated
+recovery node, and then activate the workflows. No new credential, secret,
+service, or workflow is introduced.
+
+Operators should investigate `recovery_required` rows together with restricted
+n8n execution history and the downstream systems before deciding anything.
+This read-only query exposes stage metadata without response content:
+
+```sql
+SELECT encode(sha256(convert_to(idempotency_key, 'UTF8')), 'hex') AS request_ref,
+       status,
+       workflow_stage,
+       stage_updated_at,
+       created_at,
+       updated_at,
+       completed_at,
+       response_payload IS NOT NULL AS has_public_response
+FROM flowpilot_idempotency
+WHERE status IN ('processing', 'recovery_required')
+ORDER BY COALESCE(stage_updated_at, updated_at, created_at), idempotency_key;
+```
+
+Do not blindly reset `recovery_required` to `processing`, `claimed`, or
+`business_started`: Sheets, HubSpot, PostgreSQL, or notification email may
+already contain the work. Phase 8B2 intentionally adds no mutation endpoint,
+retry engine, or generic job queue. Phase 8C remains responsible for broader
+observability and controlled operational tooling, not automatic replay.
+
+Run every optional reliability integration suite together against one fresh,
+disposable PostgreSQL 17 container:
+
+```powershell
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-phase8b2-test'
+python -m pytest tests/integration/test_followup_postgres.py tests/integration/test_idempotency_postgres.py tests/integration/test_email_recovery_postgres.py tests/integration/test_partial_work_reconciliation_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+```
+
+The tests use deterministic timestamps and transactions rather than sleeps.
+They exercise migration reruns, owner-token guards, failure classification,
+strict response storage, safe finalization, legacy handling, stale/fresh/exact
+boundaries, and all earlier PostgreSQL concurrency and delivery-state behavior.
+
+## Phase 8C: Reliability observability and audit trail
+
+Phase 8C makes the safety decisions from Phases 8A, 8B1, and 8B2 observable
+without changing them. Migration
+`postgres/init/008_add_reliability_observability.sql` is additive,
+transactional, rerunnable, and PostgreSQL 17 compatible. It creates two durable
+tables, two read-only views, narrowly scoped indexes, and database triggers for
+meaningful state changes.
+
+`flowpilot_reliability_events` is an append-oriented audit trail. Lead events
+use only the generated database lead ID. Idempotency events use a stable,
+lowercase SHA-256 reference derived from the key; the plaintext
+`Idempotency-Key` is never stored in the audit table or exposed by an
+operational view. Event names are fixed and machine-readable, including
+`lead_created`, `draft_approved`, `idempotency_business_started`,
+`idempotency_recovery_required`, `initial_email_uncertain`, and
+`followup_uncertain`.
+
+PostgreSQL `AFTER` triggers write audit events in the same transaction as the
+lead or idempotency transition. A rollback therefore removes both the state
+change and its event. `IS DISTINCT FROM` guards prevent no-op updates from
+creating duplicate events. Audit rows contain explicit status and stage
+columns only; there is no arbitrary JSON metadata field.
+
+The existing hourly recovery workflow still uses one PostgreSQL node and the
+same 30-minute email and 60-minute idempotency thresholds. Its single SQL
+statement now also inserts one row into `flowpilot_recovery_runs`, including
+when every counter is zero. A run records only sanitized totals for quarantined
+emails, failed stale claims, partial work requiring review, safe completions,
+and malformed or legacy work requiring review. It contains no customer data or
+provider output.
+
+`flowpilot_reconciliation_queue` exposes only items requiring attention:
+
+- `Needs review` for an idempotency request in `recovery_required`;
+- `Initial email delivery uncertain` for uncertain initial delivery;
+- `Follow-up delivery uncertain` for uncertain follow-up delivery.
+
+Each item has an opaque or database-local reference, friendly display status,
+separate technical state, state timestamp, age, and `requires_action` flag.
+Completed, failed, sent, and other normal terminal records do not appear.
+`flowpilot_reliability_summary` provides cheap counts plus the latest recovery
+run timestamp as a stable future dashboard contract. Neither view exposes lead
+email, message, draft content, approval tokens, response payloads, plaintext
+idempotency keys, provider errors, or credentials.
+
+Apply migration `008` before activating the updated recovery workflow:
+
+```powershell
+docker compose -f compose.postgres.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/008_add_reliability_observability.sql'
+```
+
+Import the same four workflow exports into n8n `2.37.10` and reselect the local
+`FlowPilot PostgreSQL` credential if needed. No new workflow, credential,
+external monitoring service, retry, or replay path is introduced.
+
+Useful read-only investigation queries:
+
+```sql
+SELECT item_type, item_ref, display_status, technical_status,
+       technical_stage, state_since, age_seconds
+FROM flowpilot_reconciliation_queue
+ORDER BY state_since, item_type, item_ref;
+
+SELECT * FROM flowpilot_reliability_summary;
+
+SELECT occurred_at, entity_type, entity_ref, event_type,
+       previous_status, new_status, previous_stage, new_stage
+FROM flowpilot_reliability_events
+WHERE entity_type = 'lead' AND entity_ref = '123'
+ORDER BY occurred_at, event_id;
+
+SELECT *
+FROM flowpilot_recovery_runs
+ORDER BY ran_at DESC, run_id DESC
+LIMIT 20;
+```
+
+The operator response for each friendly state is documented in
+`docs/reliability-runbook.md`. Investigation must remain read-only until the
+operator has correlated restricted workflow and downstream-system evidence.
+Do not blindly resend uncertain email, reset `recovery_required`, or replay
+Sheets, HubSpot, drafts, notifications, or email. Phase 8C adds visibility, not
+automatic recovery.
+
+## Run tests
+
+```powershell
+python -m pytest
+```
+
+Tests replace the provider through FastAPI dependency overrides. They make no network calls and require no API key.
+
+## Roadmap
+
+- **Phase 1 (complete):** AI Lead Analysis API
+- **Phase 2 (complete):** n8n webhook integration
+- **Phase 3A (complete):** PostgreSQL persistence
+- **Phase 3B (complete):** Google Sheets persistence
+- **Phase 4 (complete):** HubSpot CRM contact synchronization
+- **Phase 5 (complete):** Email notifications and AI-generated draft responses
+- **Phase 6 (complete):** Human approval workflow
+- **Phase 7 (complete):** One automated follow-up after 72 hours
+- **Phase 8A (complete):** Inbound idempotency and duplicate-request protection
+- **Phase 8B1 (complete):** Email recovery and uncertain-send reconciliation
+- **Phase 8B2 (complete):** Stale idempotency and partial-work reconciliation
+- **Phase 8C (complete):** Reliability observability and audit trail
+- **Phase 9 (complete):** Containerized deployment and reproducible packaging
+- **Phase 10A (complete):** OCI pilot deployment readiness and ingress security
+- **Phase 10 live provisioning (pending owner approval):** no cloud resources created
+
+Development stops at Phase 10A. No live OCI deployment has begun.
+
+## License
+
+FlowPilot is available under the [MIT License](../LICENSE).
