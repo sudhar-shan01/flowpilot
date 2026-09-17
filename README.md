@@ -103,6 +103,7 @@ provider validation.
 - [Reliability incident runbook](docs/reliability-runbook.md)
 - [OCI single-VM pilot deployment](docs/oci-deployment.md)
 - [Deployment threat assessment](docs/deployment-threat-model.md)
+- [Dependency and container maintenance](docs/MAINTENANCE.md)
 - [Development history](docs/development-history.md)
 - [Phase changelog](docs/CHANGELOG.md)
 
