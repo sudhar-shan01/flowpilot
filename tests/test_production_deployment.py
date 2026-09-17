@@ -58,6 +58,7 @@ def test_caddy_publishes_only_exact_safe_routes() -> None:
     assert "max_size 16KB" in CADDY
     assert "no-referrer" in CADDY
     assert "\n\tlog" not in CADDY
+    assert "/admin" not in CADDY
 
 
 def test_n8n_production_privacy_and_retention_are_bounded() -> None:

@@ -19,10 +19,13 @@ pluggy==1.6.0
 pydantic==2.13.5
 pydantic_core==2.46.5
 pydantic-settings==2.15.0
+psycopg==3.2.10
+psycopg-binary==3.2.10
 Pygments==2.21.0
 pytest==8.4.2
 python-dotenv==1.2.3
 starlette==1.6.0
+tzdata==2025.2
 typing_extensions==4.16.0
 typing-inspection==0.4.4
 uvicorn==0.52.4

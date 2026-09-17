@@ -414,14 +414,17 @@ flowpilot/
 │   ├── api/
 │   │   ├── dependencies.py
 │   │   └── routes/
+│   │       ├── admin.py
 │   │       ├── health.py
 │   │       └── leads.py
 │   ├── core/
 │   │   └── config.py
 │   ├── models/
-│   │   └── lead.py
+│   │   ├── lead.py
+│   │   └── reconciliation.py
 │   ├── services/
-│   │   └── ai_service.py
+│   │   ├── ai_service.py
+│   │   └── reconciliation.py
 │   └── main.py
 ├── tests/
 │   ├── conftest.py
@@ -440,6 +443,7 @@ flowpilot/
 │   ├── integration/test_idempotency_postgres.py
 │   ├── integration/test_email_recovery_postgres.py
 │   ├── integration/test_chaos_recovery_postgres.py
+│   ├── integration/test_admin_reconciliation_postgres.py
 │   ├── integration/test_partial_work_reconciliation_postgres.py
 │   ├── integration/test_reliability_observability_postgres.py
 │   ├── test_lead_drafts.py
@@ -1701,6 +1705,32 @@ operator has correlated restricted workflow and downstream-system evidence.
 Do not blindly resend uncertain email, reset `recovery_required`, or replay
 Sheets, HubSpot, drafts, notifications, or email. Phase 8C adds visibility, not
 automatic recovery.
+
+### Operator-only aggregate API
+
+`GET /admin/reconciliation-queue` is an optional read-only view of five
+aggregate counts: uncertain initial responses, uncertain follow-ups,
+idempotency rows requiring recovery, stale email sends, and stale initial
+idempotency claims. It returns no lead content, email address, draft, token,
+credential, idempotency key, or provider output.
+
+The route is unavailable with HTTP 404 unless
+`FLOWPILOT_ADMIN_ENABLED=true` is set exactly (comparison is
+case-insensitive). Unset, false, and invalid values keep it disabled. The base
+Compose stack supplies the existing PostgreSQL connection to the API only so
+this query can run when enabled. Production Caddy has no `/admin/*` route;
+operators must use the loopback API through the existing restricted
+administrative access path. The query runs in a read-only transaction and does
+not transition or recover work.
+
+The optional PostgreSQL aggregate test uses the same disposable-container
+contract as the other integration suites:
+
+```powershell
+$env:FLOWPILOT_TEST_PG_CONTAINER = 'flowpilot-postgres-test'
+python -m pytest tests/integration/test_admin_reconciliation_postgres.py
+Remove-Item Env:FLOWPILOT_TEST_PG_CONTAINER
+```
 
 ## Run tests
 
