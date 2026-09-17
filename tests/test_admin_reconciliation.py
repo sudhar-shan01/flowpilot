@@ -102,4 +102,3 @@ def test_admin_database_failure_is_sanitized() -> None:
     }
     assert "password" not in response.text
     assert "customer@example.com" not in response.text
-

@@ -102,4 +102,3 @@ def test_reconciliation_aggregate_query_counts_states_without_mutation(db) -> No
         "ORDER BY idempotency_key)) FROM flowpilot_idempotency;",
     ).stdout
     assert after == before
-

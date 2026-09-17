@@ -139,4 +139,3 @@ def test_stale_initial_send_is_quarantined_once_without_retry_or_smtp(db):
         "initial_response_sent_at IS NULL,"
         "followup_status IS NULL FROM leads WHERE id=1;",
     ).stdout.strip() == quarantined
-
