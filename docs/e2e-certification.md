@@ -164,7 +164,6 @@ fields at a specific provider/database boundary.
   FlowPilot. Partial and ambiguous effects deliberately require reconciliation;
   uncertain email is never automatically replayed.
 - The current deployment is one VM and has no high availability.
-- LICENSE selection remains an owner decision.
 
 ## Verification commands and results
 

@@ -360,4 +360,3 @@ dashboard, React frontend, mobile application, HA platform, or cloud resources.
   restore-test owner
 - SMTP, HubSpot, Google Sheets, and AI provider accounts/data-processing terms
 - Whether public `/health` is acceptable for the client
-- Repository license; it remains unresolved

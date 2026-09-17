@@ -1705,3 +1705,7 @@ Tests replace the provider through FastAPI dependency overrides. They make no ne
 - **Phase 10 live provisioning (pending owner approval):** no cloud resources created
 
 Development stops at Phase 10A pending review. No live OCI deployment has begun.
+
+## License
+
+FlowPilot is available under the [MIT License](LICENSE).
